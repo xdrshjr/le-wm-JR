@@ -1,0 +1,29 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.Python
+*.so
+
+# Lightning / Hydra outputs
+outputs/
+lightning_logs/
+runs/
+multirun/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local secrets / virtualenvs
+.env
+.venv/
+venv/
+
+# vendor build artifacts
+external/**/__pycache__/
+external/**/*.egg-info/
+external/**/build/
+external/**/dist/

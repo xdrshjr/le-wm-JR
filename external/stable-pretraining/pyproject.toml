@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stable-pretraining"
+description = "Stable Pretraining Library for Self-Supervised Learning"
+authors = []
+license = {text = "MIT"}
+readme = {file = "README.md", content-type = "text/markdown"}
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchmetrics",
+    "lightning",
+    "hydra-core",
+    "omegaconf",
+    "loguru",
+    "tabulate",
+    "pandas",
+    "rich",
+    "requests-cache",
+    "prettytable",
+    "submitit",
+    "timm",
+    "zstandard",
+    "typer",
+    "transformers",
+    "pillow>=11.3.0",
+    "wandb",
+    "hydra-submitit-launcher",
+    "matplotlib",
+    "datasets",
+    # Range rather than exact pin (#411): the exact ``==20.0.0`` pin conflicted
+    # with downstream packages that also depend on pyarrow. Floor matches the
+    # version that's been release-tested; upper bound excludes major versions
+    # we haven't validated yet (currently 21..24 exist on PyPI).
+    "pyarrow>=20.0.0,<25",
+    "minari[hdf5]>=0.5.3",
+    "scikit-learn>=1.7.0",
+    "richuru",
+    "opt-einsum",
+    # ``pylance`` is the official Lance package on PyPI; it ships the
+    # ``lance.*`` Python namespace. The unrelated package literally named
+    # "lance" on PyPI is a different project — do not depend on it.
+    "pylance",
+    # ``opencv-python-headless`` is the standard wheel for non-display
+    # systems (ML / HPC). Same Python API as ``opencv-python`` but doesn't
+    # require system-level libGL/X11 libraries.
+    "opencv-python-headless",
+]
+
+dynamic = ["version"]
+
+[project.scripts]
+spt = "stable_pretraining.cli:app"
+
+[project.entry-points."lightning.pytorch.callbacks_factory"]
+stablepretraining_callbacks = "stable_pretraining.callbacks.factories:default"
+
+[tool.setuptools]
+packages = ["stable_pretraining"]
+
+[tool.setuptools_scm]
+tag_regex = "^v(?P<version>.+)$"
+write_to = "stable_pretraining/_version.py"
+write_to_template = "version = \"{version}\"\n"
+
+[project.optional-dependencies]
+# Trackio experiment tracking (gradio_client is needed for self-hosted server_url mode)
+trackio = ["trackio", "gradio_client"]
+# SwanLab experiment tracking
+swanlab = ["swanlab"]
+# Development and documentation tools
+dev = [
+    "pytest",
+    "coverage",
+    "pytest-cov",
+    "codecov",
+    "pre-commit",
+    "ruff",
+    "sphinx",
+    "sphinx-gallery",
+    "sphinx-book-theme",
+    "sphinxcontrib-bibtex",
+    "matplotlib",
+    "memory_profiler",
+    "myst-parser",
+]
+
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "D"]
+ignore = ["D100", "D102", "D103", "D104", "D105", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true

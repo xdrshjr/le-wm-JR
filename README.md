@@ -1,3 +1,13 @@
+> **⚠️ Fork notice (`le-wm-JR`)**
+>
+> 本仓库是 [`lucas-maes/le-wm@c8a4417`](https://github.com/lucas-maes/le-wm/commit/c8a4417) 的 fork，
+> 增加了在 4×RTX 2080 Ti（CUDA 12.1 / torchvision 0.20）上一次性跑通 Two-Room 实验所需的 vendor 与依赖：
+>
+> - `external/stable-pretraining/`（含 torchvision shim）、`external/stable-worldmodel/`（main 分支版本）
+> - `patches/spt-torchvision-shim.patch`、`requirements-old.txt`、`conda-env-old.yml`
+> - 完整复现步骤见 [`REPRODUCE.md`](./REPRODUCE.md)
+>
+> 上游 README 原文如下：
 
 # LeWorldModel
 ### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels

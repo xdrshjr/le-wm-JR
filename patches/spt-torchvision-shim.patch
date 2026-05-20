@@ -1,0 +1,19 @@
+diff --git a/stable_pretraining/data/transforms.py b/stable_pretraining/data/transforms.py
+index 38783f25..68ed3bab 100644
+--- a/stable_pretraining/data/transforms.py
++++ b/stable_pretraining/data/transforms.py
+@@ -14,6 +14,14 @@ from torchvision.transforms.v2._utils import query_chw
+ from PIL import Image
+ 
+ from stable_pretraining.data.masking import multi_block_mask
++# torchvision compatibility shim: stable-pretraining calls v2.Transform.transform(),
++# but torchvision <=0.20 only exposes _transform. Proxy via instance lookup so subclass
++# overrides of _transform are honoured.
++if not hasattr(v2.Transform, "transform"):
++    def _sp_transform_proxy(self, *args, **kwargs):
++        return self._transform(*args, **kwargs)
++    v2.Transform.transform = _sp_transform_proxy
++
+ 
+ 
+ class Transform(v2.Transform):

@@ -1,0 +1,55 @@
+#output_dir: ./outputs
+
+defaults:
+  - launcher: local
+  - _self_
+
+
+output_model_name: dinogcbc
+dataset_name: pusht_expert_train.h5
+
+trainer:
+  max_epochs: 100
+  strategy: auto #ddp
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+
+batch_size: 128
+num_workers: ${cpus_per_task}
+train_split: 0.9
+train_subset_fraction: 1.0  # Fraction of training set to use (e.g. 0.1 for 10%)
+seed: 42
+
+image_size: 224
+patch_size: 14
+
+n_steps: ${eval:'${dinowm.num_preds} + ${dinowm.history_size} - 1'}
+frameskip: 1
+
+dinowm:
+  history_size: 3
+  num_preds: 1
+  use_proprio_encoder: false  # Set to true to able proprioception encoder
+  proprio_dim: 4
+  proprio_embed_dim: 10
+  action_dim: 2
+  action_embed_dim: 10
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.0
+  emb_dropout: 0.0
+
+# Encoder configuration
+# Options: 'dino' (pretrained frozen DINO) or 'vit_tiny' (trainable ViT tiny from scratch)
+encoder_type: dino
+
+predictor_lr: 1e-4
+proprio_encoder_lr: 1e-4
+encoder_lr: 1e-4
+
+dump_object: True
