@@ -1,7 +1,8 @@
 """ExecutableOp schema — 8 op types covering SWE-agent operations.
 
-Aligned with ``docs/plans/world-model-llm-coding-fusion/specs/03-action-space.md``
-(Phase B'.1) and consumed by ``pca.encoder.op_encoder.OpEncoder``.
+Phase B'.1 (T03.1) from
+``docs/plans/world-model-llm-coding-fusion/specs/03-action-space.md``,
+consumed by ``pca.encoder.op_encoder.OpEncoder``.
 """
 from __future__ import annotations
 

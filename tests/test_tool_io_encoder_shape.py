@@ -13,7 +13,7 @@ def main() -> int:
         import torch  # noqa: F401
 
         from pca.encoder.tool_io import ToolIOEncoder, ToolIOEncoderConfig
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         print(f"SKIP: missing dependency ({exc})")
         return 0
 

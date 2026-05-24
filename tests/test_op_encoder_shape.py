@@ -14,7 +14,7 @@ def main() -> int:
 
         from pca.action.schema import ApplyPatchArgs, RunTestArgs
         from pca.encoder.op_encoder import OpEncoder, OpEncoderConfig
-    except ImportError as exc:
+    except (ImportError, OSError) as exc:
         print(f"SKIP: missing dependency ({exc})")
         return 0
 

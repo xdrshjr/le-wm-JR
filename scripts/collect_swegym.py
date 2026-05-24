@@ -21,7 +21,9 @@ from pca.action.schema import ApplyPatchArgs
 from pca.data.schema import Step, Trajectory
 
 
-def _row_to_trajectory(row: dict, compiler: NLIntentCompiler) -> Trajectory | None:
+def _row_to_trajectory(
+    row: dict, compiler: NLIntentCompiler
+) -> Trajectory | None:
     instance_id = row.get("instance_id") or row.get("id") or ""
     if not instance_id:
         return None
