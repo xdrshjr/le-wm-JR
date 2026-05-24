@@ -1,0 +1,91 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: swetraj
+
+experiment:
+  stage: stage1
+  save_ckpt: false  # projector ckpt saved manually in train_pca.py epoch hook
+
+output_model_name: pca_projector_v1
+output_dir: runs/pca
+subdir: ${hydra:job.id}
+
+num_workers: 2
+seed: 0
+
+# 2080 Ti 11 GB budget — see spec §7.1.
+loader:
+  batch_size: 8
+  num_workers: ${num_workers}
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+
+trainer:
+  max_epochs: 2
+  devices: auto
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-4
+
+wm:
+  history_size: 3
+  num_preds: 1
+  embed_dim: 384
+
+model:
+  wm:
+    _target_: pca.world_model.TextJEPA
+    encoder:
+      _target_: pca.encoder.tool_io.ToolIOEncoder
+      cfg:
+        _target_: pca.encoder.tool_io.ToolIOEncoderConfig
+        base_model: microsoft/codebert-base
+        hidden_dim: ${wm.embed_dim}
+        out_dim: ${wm.embed_dim}
+        num_head_layers: 4
+        freeze_base: true
+        max_length: 512
+    predictor:
+      _target_: module.ARPredictor
+      num_frames: ${wm.history_size}
+      input_dim: ${wm.embed_dim}
+      hidden_dim: ${wm.embed_dim}
+      output_dim: ${wm.embed_dim}
+      depth: 6
+      heads: 16
+      mlp_dim: 2048
+      dim_head: 64
+      dropout: 0.1
+      emb_dropout: 0.0
+    action_encoder:
+      _target_: pca.encoder.op_encoder.OpEncoder
+      cfg:
+        _target_: pca.encoder.op_encoder.OpEncoderConfig
+        out_dim: ${wm.embed_dim}
+        hidden_dim: ${wm.embed_dim}
+  wm_ckpt: weights/world_model/wm_v1_epoch_3.pt
+  llm_name: Qwen/Qwen2.5-Coder-1.5B
+  projector:
+    in_dim: ${wm.embed_dim}
+    hidden_dim: 1024
+    out_dim: 1536
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: false
+  config:
+    project: pca-projector
+    mode: offline

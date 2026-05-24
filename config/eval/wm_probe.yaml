@@ -1,0 +1,28 @@
+# Probe-classifier eval (G-B gate sanity).
+# Loads a frozen TextJEPA checkpoint, fits a linear head on its z,
+# predicts op_type (8 classes). Random baseline ≈ 0.125; pass at ≥ 0.20
+# (R14 — sanity, not a strict gate).
+data:
+  path: data/trajectories/v1
+  split: val
+  max_obs_chars: 16000
+
+wm:
+  history_size: 3
+  num_preds: 1
+  embed_dim: 384
+
+model:
+  ckpt: weights/world_model/wm_v1_epoch_3.pt
+  num_op_types: 8
+
+probe:
+  max_iter: 1000
+  test_size: 0.2
+  random_state: 0
+
+loader:
+  batch_size: 32
+  num_workers: 2
+
+output: eval/wm_v1_probe.json

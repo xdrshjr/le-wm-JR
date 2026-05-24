@@ -1,0 +1,55 @@
+defaults:
+  - _self_
+  - launcher: local
+  - data: swetraj
+  - model: wm_codebert
+
+experiment:
+  stage: stage0
+  save_ckpt: true
+
+output_model_name: pca_wm_v1
+output_dir: runs/pca
+subdir: ${hydra:job.id}
+
+num_workers: 4
+seed: 0
+
+# Turing has no bf16 — keep fp16 (CLAUDE.md / R01).
+trainer:
+  max_epochs: 4
+  devices: auto
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 64
+  num_workers: ${num_workers}
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 5e-5
+  weight_decay: 1e-3
+
+wm:
+  type: pca_text_wm
+  history_size: 3
+  num_preds: 1
+  embed_dim: 384
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+wandb:
+  enabled: false
+  config:
+    project: pca-wm
+    mode: offline

@@ -1,0 +1,4 @@
+# SWE trajectory dataset for PCA Stage-0 / Stage-1.
+# Path layout: <data.path>/{train,val,test}.jsonl
+path: data/trajectories/v1
+max_obs_chars: 16000

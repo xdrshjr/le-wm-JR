@@ -1,0 +1,9 @@
+# Projector-only fragment (used standalone or composed into Stage-1 bundle).
+# Freezing of WM / LLM happens manually in train_pca.py (R04).
+_target_: pca.projector.mlp.WorldModelProjector
+cfg:
+  _target_: pca.projector.mlp.WorldModelProjectorConfig
+  in_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  out_dim: 1536            # Qwen2.5-Coder-1.5B hidden size
+  zero_init_last: true
