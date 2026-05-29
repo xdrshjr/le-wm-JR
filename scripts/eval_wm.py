@@ -71,6 +71,62 @@ def _eval_pred_loss(model, loader, ctx_len: int, n_preds: int, device):
     return total / max(count, 1)
 
 
+def _auroc(scores: list[float], labels: list[int]) -> "float | None":
+    """Mann-Whitney rank AUROC with tie handling. ``None`` if one-class."""
+    import numpy as np
+
+    if not scores:
+        return None
+    s = np.asarray(scores, dtype=float)
+    y = np.asarray(labels, dtype=int)
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return None
+    order = np.argsort(s, kind="mergesort")
+    s_sorted = s[order]
+    ranks = np.empty(len(s), dtype=float)
+    i, n = 0, len(s)
+    while i < n:
+        j = i
+        while j < n and s_sorted[j] == s_sorted[i]:
+            j += 1
+        ranks[order[i:j]] = (i + j - 1) / 2.0 + 1.0  # avg of 1-based ranks
+        i = j
+    sum_pos = float(ranks[y == 1].sum())
+    return (sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def _outcome_enabled(cfg) -> bool:
+    loss_cfg = cfg.get("loss", None)
+    outcome = loss_cfg.get("outcome") if loss_cfg is not None else None
+    return bool(outcome) and bool(outcome.get("enabled", False))
+
+
+def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
+    """Val AUROC of P(pass) vs. binarized label (status==PASS); spec §6.2."""
+    if getattr(model, "outcome_head", None) is None:
+        return None
+    model.eval()
+    scores: list[float] = []
+    labels: list[int] = []
+    with torch.no_grad():
+        for batch in loader:
+            label = batch.get("label")
+            if label is None:
+                continue
+            info = model.encode(batch)
+            emb = info["emb"].to(device)
+            act_emb = info["act_emb"].to(device)
+            pred_emb = model.predict(emb[:, :ctx_len], act_emb[:, :ctx_len])
+            logit = model.outcome_head(pred_emb[:, -1]).squeeze(-1)
+            scores.extend(torch.sigmoid(logit).float().cpu().tolist())
+            labels.extend(
+                1 if v >= 1.0 - 1e-6 else 0 for v in label.tolist()
+            )
+    return _auroc(scores, labels)
+
+
 @hydra.main(
     version_base=None,
     config_path="../config/train",
@@ -117,10 +173,23 @@ def run(cfg):
         "history_size": cfg.wm.history_size,
         "num_preds": cfg.wm.num_preds,
     }
+    # Verifier AUROC is a pure-additive field — only present when the
+    # outcome head is enabled, so goal_dist / MVP output is unchanged
+    # (spec §F2, §6.4).
+    auroc_msg = ""
+    if _outcome_enabled(cfg):
+        auroc = _eval_outcome_auroc(
+            model, loader,
+            ctx_len=cfg.wm.history_size,
+            n_preds=cfg.wm.num_preds,
+            device=device,
+        )
+        payload["auroc"] = auroc
+        auroc_msg = f" auroc={auroc}"
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(
         f"[eval_wm] split={split} tag={tag} "
-        f"pred_loss_mean={pred_loss:.6f} -> {out}"
+        f"pred_loss_mean={pred_loss:.6f}{auroc_msg} -> {out}"
     )
 
 

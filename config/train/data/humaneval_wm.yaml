@@ -1,0 +1,5 @@
+# MBPP execution-outcome trajectories for the HumanEval WM reranker.
+# Path layout: <data.path>/{train,val,test}.jsonl (+ manifest.json),
+# produced by scripts/gen_mbpp_traj.py (spec §3.1, §5.1).
+path: data/trajectories/humaneval_wm_v1
+max_obs_chars: 4000

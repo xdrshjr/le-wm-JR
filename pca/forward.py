@@ -12,6 +12,15 @@
 """
 from __future__ import annotations
 
+import torch.nn.functional as F
+
+
+def _outcome_enabled(cfg) -> bool:
+    """True iff a verifier OutcomeHead BCE term is configured (spec §F1)."""
+    loss_cfg = cfg.get("loss") if hasattr(cfg, "get") else None
+    outcome = loss_cfg.get("outcome") if loss_cfg is not None else None
+    return bool(outcome) and bool(outcome.get("enabled", False))
+
 
 def pca_forward(self, batch, stage, cfg):
     ctx_len = cfg.wm.history_size
@@ -34,6 +43,19 @@ def pca_forward(self, batch, stage, cfg):
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"] = self.sigreg(emb.transpose(0, 1))  # Δ3
     output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+
+    # Δ5 (spec §4.2 / F1): optional verifier head. Fully short-circuited
+    # when loss.outcome is absent/disabled or the batch carries no label —
+    # the path above is then byte-identical to the MVP forward.
+    label = batch.get("label")
+    if _outcome_enabled(cfg) and label is not None:
+        mu = cfg.loss.outcome.get("weight", 1.0)
+        logit = self.model.outcome_head(pred_emb[:, -1]).squeeze(-1)  # (B,)
+        target = label.to(logit.device, dtype=logit.dtype)
+        output["outcome_loss"] = F.binary_cross_entropy_with_logits(
+            logit, target
+        )
+        output["loss"] = output["loss"] + mu * output["outcome_loss"]
 
     losses_dict = {
         f"{stage}/{k}": v.detach()

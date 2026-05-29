@@ -79,10 +79,14 @@ class TrajectoryDataset(Dataset):
         cap = self.cfg.max_obs_chars
         obs_text: list[str] = [s.obs_text[:cap] for s in steps]
         op_list: list[ExecutableOp] = [s.op for s in steps]
+        # Window label = step0's label (the predicted-from step). This is
+        # the only entry point for ``label`` into the batch (spec §F1); the
+        # OutcomeHead is supervised on the post-``op`` outcome of step0.
         return {
             "obs_text": obs_text,
             "op": op_list,
             "instance_id": traj.instance_id,
+            "label": steps[0].label,
         }
 
 

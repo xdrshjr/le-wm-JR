@@ -20,7 +20,40 @@ class TextJEPA(JEPA):
         out (written):
             emb:       (B, T, embed_dim)
             act_emb:   (B, T, embed_dim)
+
+    Optionally carries an ``outcome_head`` (``pca.outcome_head.OutcomeHead``)
+    that maps a predicted next-state embedding to a pass/fail logit for the
+    verifier reranker (spec §3.5/§4.2). It stays ``None`` for goal_dist /
+    MVP configs, keeping the base JEPA contract unchanged (R02).
     """
+
+    def __init__(
+        self,
+        encoder,
+        predictor,
+        action_encoder,
+        projector=None,
+        pred_proj=None,
+        outcome_head=None,
+    ):
+        super().__init__(encoder, predictor, action_encoder, projector,
+                         pred_proj)
+        # Registered as a submodule when provided (so it lands in the
+        # state_dict); a plain ``None`` attribute otherwise.
+        self.outcome_head = outcome_head
+
+    def predict_outcome(self, pred_emb):
+        """Map a predicted embedding to a pass logit.
+
+        ``pred_emb`` may be (B, D) or (B, T, D); returns the logit with the
+        trailing singleton squeezed. Raises if no head is attached.
+        """
+        if self.outcome_head is None:
+            raise RuntimeError(
+                "TextJEPA.predict_outcome called but outcome_head is None "
+                "(train with loss.outcome.enabled=true / a verifier config)"
+            )
+        return self.outcome_head(pred_emb).squeeze(-1)
 
     def encode(self, info: dict) -> dict:
         obs_text: list[list[str]] = info["obs_text"]
