@@ -1,0 +1,54 @@
+# MVP world-model config: locally-cached models, smaller predictor.
+_target_: pca.world_model.TextJEPA
+
+encoder:
+  _target_: pca.encoder.tool_io.ToolIOEncoder
+  cfg:
+    _target_: pca.encoder.tool_io.ToolIOEncoderConfig
+    base_model: sentence-transformers/all-MiniLM-L6-v2
+    hidden_dim: ${wm.embed_dim}
+    out_dim: ${wm.embed_dim}
+    num_head_layers: 2
+    freeze_base: true
+    max_length: 128
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${wm.history_size}
+  input_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  depth: 3
+  heads: 8
+  mlp_dim: 1024
+  dim_head: 48
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: pca.encoder.op_encoder.OpEncoder
+  cfg:
+    _target_: pca.encoder.op_encoder.OpEncoderConfig
+    num_op_types: 8
+    arg_max_tokens: 64
+    out_dim: ${wm.embed_dim}
+    hidden_dim: ${wm.embed_dim}
+    tokenizer_name: Qwen/Qwen2.5-1.5B-Instruct
+
+projector:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

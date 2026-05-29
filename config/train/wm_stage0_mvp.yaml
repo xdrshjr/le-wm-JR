@@ -1,0 +1,64 @@
+# MVP override of wm_stage0 for single-GPU smoke / convergence run.
+# Uses locally-cached HF models on the remote box (no internet needed):
+#   encoder base = sentence-transformers/all-MiniLM-L6-v2 (hidden=384)
+#   op tokenizer = Qwen/Qwen2.5-1.5B-Instruct
+defaults:
+  - launcher: local
+  - data: swetraj
+  - model: wm_codebert_mvp
+  - _self_
+
+experiment:
+  stage: stage0
+  save_ckpt: true
+
+output_model_name: pca_wm_mvp_v1
+output_dir: runs/pca_mvp
+subdir: ${hydra:job.id}
+
+num_workers: 2
+seed: 0
+
+# Turing has no bf16 — keep fp16 (CLAUDE.md / R01).
+trainer:
+  max_epochs: 6
+  devices: 1
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 5
+
+loader:
+  batch_size: 16
+  num_workers: ${num_workers}
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 3e-4
+  weight_decay: 1e-3
+
+wm:
+  type: pca_text_wm_mvp
+  history_size: 3
+  num_preds: 1
+  embed_dim: 384
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+
+data:
+  path: data/trajectories/mvp_v1
+  max_obs_chars: 4000
+
+wandb:
+  enabled: false
+  config:
+    project: pca-wm
+    mode: offline
