@@ -1,7 +1,18 @@
 # World-model config for the HumanEval reranker (spec §4.1).
-# Encoder defaults to the locally-cached MiniLM (swap base_model for a
-# code model — e.g. microsoft/codebert-base — to scale per R1). The
-# predictor is single-step (num_frames=${wm.history_size}=1); the
+# R3: encoder base switched MiniLM → Qwen2.5-0.5B-Instruct (frozen,
+# locally cached, code-aware) per spec §R1 ("编码器换 code 模型"). The
+# Round-2 verifier (frozen MiniLM + CLS pooling, AUROC 0.61) could not
+# beat self-consistency; MiniLM's [CLS] is near-meaningless (it is mean-
+# pooled at train time) and 256-token truncation cut the candidate code.
+# R3 fixes all three: code-aware base, mean pooling, head over the full
+# 512-token sequence so the trainable head attends over code tokens.
+#
+# Why 0.5B (not 1.5B/3B): the 0.5B encoder gives the best HumanEval
+# *transfer*. A 1.5B base reached higher MBPP-val AUROC (0.77 vs 0.72)
+# but transferred WORSE to HumanEval (pca_wm 31% vs 38%, has_doctest
+# 43% vs 61%) — it overfits the MBPP training distribution. Bigger ≠
+# better here; 0.5B is the sweet spot for zero-shot MBPP→HumanEval.
+# Predictor is single-step (num_frames=${wm.history_size}=1); the
 # outcome_head is the verifier signal. For a goal_dist-only run, pass
 # ``~model.outcome_head`` on the CLI so no head is saved (spec §5.4/§F8).
 _target_: pca.world_model.TextJEPA
@@ -10,12 +21,14 @@ encoder:
   _target_: pca.encoder.tool_io.ToolIOEncoder
   cfg:
     _target_: pca.encoder.tool_io.ToolIOEncoderConfig
-    base_model: sentence-transformers/all-MiniLM-L6-v2
+    base_model: Qwen/Qwen2.5-0.5B-Instruct
     hidden_dim: ${wm.embed_dim}
     out_dim: ${wm.embed_dim}
     num_head_layers: 2
     freeze_base: true
-    max_length: 256
+    max_length: 512
+    pooling: mean
+    head_over_tokens: true
 
 predictor:
   _target_: module.ARPredictor

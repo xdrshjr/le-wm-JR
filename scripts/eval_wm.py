@@ -71,6 +71,44 @@ def _eval_pred_loss(model, loader, ctx_len: int, n_preds: int, device):
     return total / max(count, 1)
 
 
+def _eval_scale_invariant(model, loader, ctx_len: int, n_preds: int, device):
+    """Scale-invariant prediction quality (spec §6.2, dev-log R2).
+
+    Raw ``pred_loss`` (MSE between predicted and target latents) is
+    confounded for a SIGReg-regularised JEPA: SIGReg inflates the target
+    embedding variance during training, so the absolute MSE can *rise*
+    even as the prediction improves (and a *lower* raw MSE can merely mean
+    representation collapse). These two metrics are scale-robust and are
+    what the gate compares across the random-init baseline vs. trained:
+
+      norm_mse = E[||pred - tgt||^2] / E[Var_dim(tgt)]   (lower = better)
+      cosine   = mean cosine(pred, tgt)                  (higher = better)
+    """
+    import torch.nn.functional as F
+
+    model.eval()
+    sum_mse = sum_var = sum_cos = count = 0.0
+    with torch.no_grad():
+        for batch in loader:
+            info = model.encode(batch)
+            emb = info["emb"].to(device)
+            act_emb = info["act_emb"].to(device)
+            tgt = emb[:, n_preds:]
+            pred = model.predict(emb[:, :ctx_len], act_emb[:, :ctx_len])
+            p = pred.flatten(0, 1)
+            t = tgt.flatten(0, 1)
+            sum_mse += (p - t).pow(2).mean(-1).sum().item()
+            sum_var += t.var(dim=-1, unbiased=False).sum().item()
+            sum_cos += F.cosine_similarity(p, t, dim=-1).sum().item()
+            count += p.size(0)
+    count = max(count, 1)
+    return {
+        "norm_mse": sum_mse / max(sum_var, 1e-9),
+        "cosine": sum_cos / count,
+        "tgt_var": sum_var / count,
+    }
+
+
 def _auroc(scores: list[float], labels: list[int]) -> "float | None":
     """Mann-Whitney rank AUROC with tie handling. ``None`` if one-class."""
     import numpy as np
@@ -160,6 +198,13 @@ def run(cfg):
         device=device,
     )
 
+    scale_inv = _eval_scale_invariant(
+        model, loader,
+        ctx_len=cfg.wm.history_size,
+        n_preds=cfg.wm.num_preds,
+        device=device,
+    )
+
     out_dir = Path(cfg.get("output_dir", "runs/pca_mvp"))
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"eval_{split}_{tag}.json"
@@ -168,6 +213,11 @@ def run(cfg):
         "tag": tag,
         "ckpt": ckpt,
         "pred_loss_mean": pred_loss,
+        # Scale-invariant gate metrics (robust to SIGReg variance growth;
+        # compare these across baseline vs. trained, not raw pred_loss).
+        "norm_mse": scale_inv["norm_mse"],
+        "cosine": scale_inv["cosine"],
+        "tgt_var": scale_inv["tgt_var"],
         "data_path": cfg.data.path,
         "embed_dim": cfg.wm.embed_dim,
         "history_size": cfg.wm.history_size,
@@ -189,7 +239,9 @@ def run(cfg):
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(
         f"[eval_wm] split={split} tag={tag} "
-        f"pred_loss_mean={pred_loss:.6f}{auroc_msg} -> {out}"
+        f"pred_loss_mean={pred_loss:.6f} "
+        f"norm_mse={scale_inv['norm_mse']:.4f} "
+        f"cosine={scale_inv['cosine']:.4f}{auroc_msg} -> {out}"
     )
 
 

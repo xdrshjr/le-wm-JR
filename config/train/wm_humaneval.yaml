@@ -28,7 +28,7 @@ seed: 0
 
 # Turing has no bf16 — keep fp16 (CLAUDE.md / R01).
 trainer:
-  max_epochs: 6
+  max_epochs: 12       # R2: 6→12, small-data verifier needs more passes
   devices: 1
   accelerator: gpu
   precision: 16-mixed
@@ -44,7 +44,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 3e-4
+  lr: 1e-4             # R2: 3e-4→1e-4, 3e-4 destabilised the shared encoder
   weight_decay: 1e-3
 
 wm:
@@ -61,9 +61,12 @@ loss:
       num_proj: 1024
   # Verifier OutcomeHead BCE (spec §4.2). Set enabled=false (and pass
   # ~model.outcome_head) for a goal_dist-only ablation.
+  # R2: weight 1.0→0.5 — at 1.0 the BCE (~0.6) dominated the much smaller
+  # next-latent MSE (~0.05) and distorted the shared encoder; 0.5 keeps the
+  # verifier head learning (val AUROC 0.47→0.61) without starving prediction.
   outcome:
     enabled: true
-    weight: 1.0
+    weight: 0.5
 
 data:
   path: data/trajectories/humaneval_wm_v1
