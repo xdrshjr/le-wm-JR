@@ -165,6 +165,108 @@ def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
     return _auroc(scores, labels)
 
 
+# ----- Stage-1 alignment quality (wm-llm-alignment §6, P1) -------------
+
+
+def _read_pairs(pairs_path: str) -> list[dict]:
+    return [
+        json.loads(l)
+        for l in Path(pairs_path).read_text(encoding="utf-8").splitlines()
+        if l.strip()
+    ]
+
+
+def _wm_latents(model, obs_texts: list[str], device, cap: int = 4000):
+    """Predicted ẑ₁ for each step0 observation → (N, d_wm)."""
+    from pca.action.schema import RunTestArgs
+
+    op = RunTestArgs(selector="visible_tests", timeout_sec=5)
+    info = {
+        "obs_text": [[t[:cap]] for t in obs_texts],
+        "op": [[op] for _ in obs_texts],
+    }
+    with torch.no_grad():
+        info = model.encode(info)
+        z1 = model.predict(info["emb"][:, :1], info["act_emb"][:, :1])[:, -1]
+    return z1.float().to(device)
+
+
+def _text_vectors(llm_name: str, texts: list[str], device):
+    """Frozen LLM masked-mean sentence vectors → ((N, d_llm), d_llm)."""
+    from transformers import AutoModel, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(llm_name)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    lm = AutoModel.from_pretrained(
+        llm_name, torch_dtype=torch.float16
+    ).to(device).eval()
+    enc = tok(
+        texts, return_tensors="pt", padding=True,
+        truncation=True, max_length=256,
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.no_grad():
+        hidden = lm(**enc).last_hidden_state
+    mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+    pooled = (hidden * mask).sum(1) / mask.sum(1).clamp_min(1.0)
+    return pooled.float(), int(lm.config.hidden_size)
+
+
+def _projector_from_ckpt(ckpt: str, d_llm: int):
+    from pca.projector.mlp import (
+        WorldModelProjector,
+        WorldModelProjectorConfig,
+    )
+
+    sd = torch.load(ckpt, map_location="cpu")
+    k = max(1, int(sd["fc2.weight"].shape[0]) // d_llm)
+    pcfg = WorldModelProjectorConfig(
+        in_dim=int(sd["fc1.weight"].shape[1]),
+        hidden_dim=int(sd["fc1.weight"].shape[0]),
+        out_dim=d_llm,
+        num_tokens=k,
+        dtype=torch.float32,
+    )
+    proj = WorldModelProjector(pcfg)
+    proj.load_state_dict(sd, strict=False)
+    return proj
+
+
+def _retrieval_at_1(p, t) -> float:
+    import torch.nn.functional as F
+
+    p = F.normalize(p.float(), dim=-1)
+    t = F.normalize(t.float(), dim=-1)
+    pred = (p @ t.t()).argmax(dim=-1)
+    target = torch.arange(p.size(0), device=p.device)
+    return float((pred == target).float().mean().item())
+
+
+def _eval_alignment_quality(cfg, model, device):
+    """Retrieval@1 of projected ẑ₁ → result-text vector (spec §6, P1).
+
+    Pure-additive: returns ``None`` unless ``align_ckpt`` + ``pairs`` are
+    set, so the standard WM eval path is unchanged.
+    """
+    align_ckpt = cfg.get("align_ckpt")
+    pairs_path = cfg.get("pairs")
+    if not align_ckpt or not pairs_path:
+        return None
+    rows = _read_pairs(pairs_path)[: int(cfg.get("align_limit", 256))]
+    if not rows:
+        return None
+    llm_name = cfg.get("llm_name", "Qwen/Qwen2.5-1.5B-Instruct")
+    t, d_llm = _text_vectors(
+        llm_name, [r["outcome_text"] for r in rows], device
+    )
+    proj = _projector_from_ckpt(align_ckpt, d_llm).to(device).eval()
+    z1 = _wm_latents(model, [r["step0_obs"] for r in rows], device)
+    with torch.no_grad():
+        p = proj(z1).mean(dim=1)
+    return {"retrieval_at_1": _retrieval_at_1(p, t), "n_pairs": len(rows)}
+
+
 @hydra.main(
     version_base=None,
     config_path="../config/train",
@@ -236,12 +338,20 @@ def run(cfg):
         )
         payload["auroc"] = auroc
         auroc_msg = f" auroc={auroc}"
+
+    # Stage-1 alignment quality — additive, only when align_ckpt+pairs set.
+    align = _eval_alignment_quality(cfg, model, device)
+    align_msg = ""
+    if align is not None:
+        payload["alignment"] = align
+        align_msg = f" align@1={align['retrieval_at_1']:.3f}"
+
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(
         f"[eval_wm] split={split} tag={tag} "
         f"pred_loss_mean={pred_loss:.6f} "
         f"norm_mse={scale_inv['norm_mse']:.4f} "
-        f"cosine={scale_inv['cosine']:.4f}{auroc_msg} -> {out}"
+        f"cosine={scale_inv['cosine']:.4f}{auroc_msg}{align_msg} -> {out}"
     )
 
 

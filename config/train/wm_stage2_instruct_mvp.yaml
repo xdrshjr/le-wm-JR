@@ -1,0 +1,76 @@
+# MVP Stage-2 instruction tuning: single-GPU 1-epoch sanity (§6, P1).
+#
+# Qwen2.5-0.5B-Instruct + LoRA + MiniLM WM (no outcome_head → BCE term is a
+# no-op, CE-only sanity). Checks the predict-conditioned CE loop runs with no
+# NaN and loss falls. Consumes the same instruct.jsonl as the full config
+# (build_alignment_data must have produced data/align/v1 first).
+defaults:
+  - launcher: local
+  - model@model.wm: wm_codebert_mvp
+  - _self_
+
+experiment:
+  stage: stage2
+  save_ckpt: false
+  stage1_ckpt: null
+
+output_model_name: pca_align_stage2_mvp
+output_dir: runs/pca_align_mvp
+subdir: ${hydra:job.id}
+
+num_workers: 2
+seed: 0
+
+trainer:
+  max_epochs: 1
+  devices: 1
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 5
+
+loader:
+  batch_size: 1
+  num_workers: ${num_workers}
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 0.0
+
+wm:
+  history_size: 1
+  num_preds: 1
+  embed_dim: 384
+
+model:
+  wm_ckpt: null
+  llm_name: Qwen/Qwen2.5-0.5B-Instruct
+  wm_config_name: wm_codebert_mvp
+  cond_signal: both
+  alpha: 0.5
+  projector:
+    hidden_dim: 1024
+    out_dim: 896
+    num_tokens: 4
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+
+loss:
+  outcome:
+    weight: 0.5
+
+data:
+  path: data/align/v1
+  val_frac: 0.1
+
+wandb:
+  enabled: false
+  config:
+    project: pca-align
+    mode: offline

@@ -1,13 +1,23 @@
-"""PCA training entry point (R03).
+"""PCA training entry point (R03 + wm-llm-alignment §3).
 
 Bypasses ``swm.data.load_dataset`` by consuming ``TrajectoryDataset``
-directly. Dispatches between Stage-0 (world model only) and Stage-1
-(projector only) via ``cfg.experiment.stage``. Freezing is done
-manually with ``requires_grad_(False)`` (R04 — Lightning 2.x has no
-``Freeze`` callback).
+directly. Dispatches on ``cfg.experiment.stage``:
+
+    stage0  world model only (TextJEPA + OutcomeHead)        — unchanged
+    stage1  LLaVA feature alignment (projector only)         — real loss
+    stage2  predict-conditioned instruction tuning           — projector
+            + Qwen-LoRA + OutcomeHead
+
+Stage-1 replaces the old norm-matching stub with ``AlignStage1Module``
+(InfoNCE + cosine); Stage-2 is new (``InstructStage2Module``). Freezing is
+manual via ``requires_grad_(False)`` (R04 — Lightning 2.x has no ``Freeze``
+callback). Stage products are written by ``StageCkptCallback`` (spec §3 R6):
+``stage1/weights_epoch_{N}.pt`` (projector) and ``stage2/`` (projector.pt +
+lora/ + outcome_head.pt + align_config.json).
 """
 from __future__ import annotations
 
+import json
 import os
 from functools import partial
 from pathlib import Path
@@ -18,6 +28,7 @@ import stable_pretraining as spt
 import torch
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
+from torch.utils.data import DataLoader
 
 from module import SIGReg
 from pca.data.collate import collate_trajectories
@@ -67,6 +78,36 @@ def _freeze(module: torch.nn.Module) -> None:
     module.eval()
 
 
+def _load_wm(cfg) -> torch.nn.Module:
+    """Instantiate the frozen world model and load the Stage-0 ckpt."""
+    world_model = hydra.utils.instantiate(cfg.model.wm)
+    if cfg.model.get("wm_ckpt"):
+        state = torch.load(cfg.model.wm_ckpt, map_location="cpu")
+        if hasattr(state, "state_dict"):
+            state = state.state_dict()
+        world_model.load_state_dict(state, strict=False)
+    _freeze(world_model)
+    return world_model
+
+
+def _build_train_projector(cfg) -> torch.nn.Module:
+    """Projector with fp32 master weights (AMP/16-mixed needs fp32)."""
+    from pca.projector.mlp import (
+        WorldModelProjector,
+        WorldModelProjectorConfig,
+    )
+
+    proj = cfg.model.projector
+    pcfg = WorldModelProjectorConfig(
+        in_dim=cfg.wm.embed_dim,
+        hidden_dim=proj.hidden_dim,
+        out_dim=proj.out_dim,
+        num_tokens=proj.get("num_tokens", 4),
+        dtype=torch.float32,
+    )
+    return WorldModelProjector(pcfg)
+
+
 def run_stage0(cfg) -> None:
     train, val = _build_loaders(cfg)
     world_model = hydra.utils.instantiate(cfg.model)
@@ -92,84 +133,166 @@ def run_stage0(cfg) -> None:
 
 
 def run_stage1(cfg) -> None:
-    """Stage-1 — train projector only with frozen WM and frozen LLM.
+    """Stage-1 — real feature alignment (InfoNCE + cosine), projector only.
 
-    The Qwen LLM is loaded lazily inside the Lightning module so that
-    Hydra config-only dry-runs do not require a HF download.
+    WM + LLM frozen. Trains the ``WorldModelProjector`` so the projected
+    predicted-outcome latent lands in the LLM's representation of the
+    actual result text (spec §2.4 L1). Replaces the norm-matching stub.
     """
-    from pca.projector.mlp import (
-        WorldModelProjector,
-        WorldModelProjectorConfig,
-    )
+    from pca.training import AlignStage1Module
 
     train, val = _build_loaders(cfg)
-    world_model = hydra.utils.instantiate(cfg.model.wm)
-    if cfg.model.wm_ckpt:
-        state = torch.load(cfg.model.wm_ckpt, map_location="cpu")
-        world_model.load_state_dict(state, strict=False)
-    _freeze(world_model)
-
-    proj_cfg = WorldModelProjectorConfig(
-        in_dim=cfg.wm.embed_dim,
-        hidden_dim=cfg.model.projector.hidden_dim,
-        out_dim=cfg.model.projector.out_dim,
-    )
-    projector = WorldModelProjector(proj_cfg)
-
-    module = _Stage1Module(
+    world_model = _load_wm(cfg)
+    projector = _build_train_projector(cfg)
+    module = AlignStage1Module(
         world_model=world_model,
         projector=projector,
         llm_name=cfg.model.llm_name,
         optimizer_cfg=dict(cfg.optimizer),
+        loss_cfg=dict(cfg.loss.get("align", {})),
     )
     data_module = spt.data.DataModule(train=train, val=val)
-    _launch_trainer(cfg, module, data_module)
+    _launch_stage_trainer(cfg, module, data_module, "stage1")
 
 
-class _Stage1Module(pl.LightningModule):
-    """Minimal projector trainer — see Spec §2.2 Stage-1."""
+def _build_instruct_loaders(cfg) -> tuple:
+    from pca.training.llava_stages import InstructDataset, collate_instruct
 
-    def __init__(
-        self,
-        world_model: torch.nn.Module,
-        projector: torch.nn.Module,
-        llm_name: str,
-        optimizer_cfg: dict,
-    ) -> None:
+    val_frac = cfg.data.get("val_frac", 0.1)
+    train_set = InstructDataset(cfg.data.path, "train", val_frac, cfg.seed)
+    val_set = InstructDataset(cfg.data.path, "val", val_frac, cfg.seed)
+    kwargs = OmegaConf.to_container(cfg.loader, resolve=True)
+    gen = torch.Generator().manual_seed(cfg.seed)
+    train = DataLoader(
+        train_set, shuffle=True, drop_last=True,
+        collate_fn=collate_instruct, generator=gen, **kwargs,
+    )
+    val = DataLoader(
+        val_set, shuffle=False, drop_last=False,
+        collate_fn=collate_instruct, **kwargs,
+    )
+    return train, val
+
+
+def run_stage2(cfg) -> None:
+    """Stage-2 — predict-conditioned instruction tuning (spec §2.4 L2).
+
+    WM frozen except ``outcome_head`` (auxiliary verifier BCE); trains
+    projector + Qwen-LoRA + outcome_head. Optionally warm-starts the
+    projector from ``experiment.stage1_ckpt``.
+    """
+    from pca.training.llava_stages import InstructStage2Module
+
+    world_model = _load_wm(cfg)
+    _unfreeze_outcome_head(world_model)
+    projector = _build_train_projector(cfg)
+    stage1_ckpt = cfg.experiment.get("stage1_ckpt")
+    if stage1_ckpt:
+        state = torch.load(stage1_ckpt, map_location="cpu")
+        projector.load_state_dict(state, strict=False)
+    train, val = _build_instruct_loaders(cfg)
+    module = InstructStage2Module(
+        world_model=world_model,
+        projector=projector,
+        llm_name=cfg.model.llm_name,
+        train_cfg=_stage2_train_cfg(cfg),
+    )
+    data_module = spt.data.DataModule(train=train, val=val)
+    _launch_stage_trainer(cfg, module, data_module, "stage2")
+
+
+def _unfreeze_outcome_head(world_model: torch.nn.Module) -> None:
+    head = getattr(world_model, "outcome_head", None)
+    if head is None:
+        return
+    for p in head.parameters():
+        p.requires_grad_(True)
+    head.train()
+
+
+def _stage2_train_cfg(cfg) -> dict:
+    return {
+        "mu": cfg.loss.get("outcome", {}).get("weight", 0.5),
+        "optimizer": dict(cfg.optimizer),
+        "lora": OmegaConf.to_container(cfg.model.get("lora", {}), resolve=True),
+    }
+
+
+# ----- stage-1/2 checkpoint saving (spec §3 R6) -----------------------
+
+
+class StageCkptCallback(pl.Callback):
+    """Save Stage-1 projector / Stage-2 aligned product each epoch."""
+
+    def __init__(self, run_dir: Path, stage: str, meta: dict) -> None:
         super().__init__()
-        self.world_model = world_model
-        self.projector = projector
-        self.llm_name = llm_name
-        self.optimizer_cfg = optimizer_cfg
-        self._llm = None
+        self.run_dir = Path(run_dir)
+        self.stage = stage
+        self.meta = meta
 
-    def _ensure_llm(self) -> None:
-        if self._llm is not None:
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        super().on_train_epoch_end(trainer, pl_module)
+        if not trainer.is_global_zero:
             return
-        from transformers import AutoModelForCausalLM
+        epoch = trainer.current_epoch + 1
+        if self.stage == "stage1":
+            self._save_stage1(pl_module, epoch)
+        else:
+            self._save_stage2(pl_module)
 
-        llm = AutoModelForCausalLM.from_pretrained(
-            self.llm_name, torch_dtype=torch.float16
+    def _save_stage1(self, module, epoch: int) -> None:
+        d = self.run_dir / "stage1"
+        d.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            module.projector.state_dict(), d / f"weights_epoch_{epoch}.pt"
         )
-        llm.gradient_checkpointing_enable()
-        _freeze(llm)
-        self._llm = llm.to(self.device)
 
-    def training_step(self, batch, batch_idx):
-        self._ensure_llm()
-        info = self.world_model.encode(batch)
-        z_t = info["emb"][:, -1]
-        z_proj = self.projector(z_t)  # (B, 1, d_llm)
-        # Stub Stage-1 supervision: align z_proj norm to LLM embed stats.
-        embed_layer = self._llm.get_input_embeddings()
-        tgt_norm = embed_layer.weight.detach().norm(dim=-1).mean()
-        loss = (z_proj.norm(dim=-1) - tgt_norm).pow(2).mean()
-        self.log("stage1/proj_norm_loss", loss.detach(), prog_bar=True)
-        return loss
+    def _save_stage2(self, module) -> None:
+        d = self.run_dir / "stage2"
+        d.mkdir(parents=True, exist_ok=True)
+        torch.save(module.projector.state_dict(), d / "projector.pt")
+        head = getattr(module.world_model, "outcome_head", None)
+        if head is not None:
+            torch.save(head.state_dict(), d / "outcome_head.pt")
+        module.llm.save_pretrained(str(d / "lora"))
+        (d / "align_config.json").write_text(
+            json.dumps(self.meta, indent=2), encoding="utf-8"
+        )
 
-    def configure_optimizers(self):
-        optim_cls = getattr(torch.optim, self.optimizer_cfg.pop("type"))
-        return optim_cls(self.projector.parameters(), **self.optimizer_cfg)
+
+def _stage_meta(cfg, stage: str) -> dict:
+    proj = cfg.model.projector
+    return {
+        "stage": stage,
+        "num_tokens": proj.get("num_tokens", 4),
+        "cond_signal": cfg.model.get("cond_signal", "both"),
+        "alpha": cfg.model.get("alpha", 0.5),
+        "llm_name": cfg.model.llm_name,
+        "wm_config": cfg.model.get("wm_config_name", "wm_humaneval"),
+    }
+
+
+def _launch_stage_trainer(cfg, module, data_module, stage: str) -> None:
+    run_dir = Path(cfg.get("output_dir", "runs/pca"), cfg.get("subdir") or "")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = None
+    if cfg.wandb.enabled:
+        logger = WandbLogger(**cfg.wandb.config)
+        logger.log_hyperparams(OmegaConf.to_container(cfg))
+
+    with open(run_dir / "config.yaml", "w", encoding="utf-8") as fh:
+        OmegaConf.save(cfg, fh)
+
+    callbacks = [StageCkptCallback(run_dir, stage, _stage_meta(cfg, stage))]
+    trainer = pl.Trainer(
+        **cfg.trainer,
+        callbacks=callbacks,
+        num_sanity_val_steps=0,
+        logger=logger,
+        enable_checkpointing=False,
+    )
+    trainer.fit(module, datamodule=data_module)
 
 
 def _launch_trainer(cfg, module, data_module) -> None:
@@ -217,9 +340,12 @@ def run(cfg):
         run_stage0(cfg)
     elif stage == "stage1":
         run_stage1(cfg)
+    elif stage == "stage2":
+        run_stage2(cfg)
     else:
         raise ValueError(
-            f"Unknown experiment.stage={stage!r} (expected stage0|stage1)"
+            f"Unknown experiment.stage={stage!r} "
+            "(expected stage0|stage1|stage2)"
         )
 
 

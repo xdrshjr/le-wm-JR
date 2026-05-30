@@ -1,0 +1,85 @@
+# Stage-2: predict-conditioned instruction tuning — wm-llm-alignment §2.4.
+#
+# Trains projector + Qwen-LoRA + OutcomeHead (WM frozen) to write the gold
+# solution while reading the WM soft tokens, plus an auxiliary verifier BCE
+# (μ = loss.outcome.weight). Consumes instruct.jsonl from build_alignment_data.
+# Warm-start the projector from a Stage-1 ckpt via experiment.stage1_ckpt.
+#
+#   python train_pca.py --config-name=wm_stage2_instruct \
+#       model.wm_ckpt=<stage0 best> data.path=data/align/v1 \
+#       experiment.stage1_ckpt=runs/pca_align/<job>/stage1/weights_epoch_<N>.pt
+#
+# Product (StageCkptCallback, spec §3 R6): runs/pca_align/<job>/stage2/
+#   projector.pt + lora/ + outcome_head.pt + align_config.json  → --aligned-ckpt
+defaults:
+  - launcher: local
+  - model@model.wm: wm_codebert_humaneval
+  - _self_
+
+experiment:
+  stage: stage2
+  save_ckpt: false
+  stage1_ckpt: null  # optional projector warm-start (Stage-1 product)
+
+output_model_name: pca_align_stage2_v1
+output_dir: runs/pca_align
+subdir: ${hydra:job.id}
+
+num_workers: 2
+seed: 0
+
+# Turing / 3090: no bf16 — fp16 mixed precision (CLAUDE.md / R01).
+trainer:
+  max_epochs: 2
+  devices: 1
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 5
+
+# Qwen-1.5B + LoRA on a 24 GB 3090 — small batch + gradient checkpointing.
+loader:
+  batch_size: 2
+  num_workers: ${num_workers}
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 0.0
+
+wm:
+  history_size: 1
+  num_preds: 1
+  embed_dim: 384
+
+model:
+  wm_ckpt: null  # REQUIRED override: model.wm_ckpt=<stage0 best ckpt>
+  llm_name: Qwen/Qwen2.5-1.5B-Instruct
+  wm_config_name: wm_humaneval
+  cond_signal: both
+  alpha: 0.5
+  projector:
+    hidden_dim: 1024
+    out_dim: 1536
+    num_tokens: 4
+  lora:
+    rank: 8
+    alpha: 16
+    dropout: 0.05
+
+loss:
+  outcome:
+    weight: 0.5  # μ — auxiliary verifier BCE (spec §2.4 L2)
+
+data:
+  path: data/align/v1  # instruct.jsonl from build_alignment_data
+  val_frac: 0.1
+
+wandb:
+  enabled: false
+  config:
+    project: pca-align
+    mode: offline
