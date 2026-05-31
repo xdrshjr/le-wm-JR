@@ -27,9 +27,11 @@ hidden test.
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -91,6 +93,29 @@ def _zscore(x: torch.Tensor) -> torch.Tensor:
     return (x - x.mean()) / x.std(unbiased=False).clamp_min(1e-6)
 
 
+def _ast_canonical(program: str) -> str:
+    """Normalised AST dump (docstrings/format stripped) for vote clustering.
+
+    Mirrors ``bench_humaneval.ast_canonical`` so the consistency term buckets
+    candidates exactly as self_consistency does; parse failures form their
+    own bucket (spec §2.2 P1-C).
+    """
+    try:
+        tree = ast.parse(program)
+    except SyntaxError:
+        return f"__parse_err__::{program}"
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Module)):
+            body = getattr(node, "body", [])
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(getattr(body[0], "value", None),
+                                   ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                node.body = body[1:]
+    return ast.dump(tree, annotate_fields=False, include_attributes=False)
+
+
 def _freeze(module: nn.Module) -> None:
     for p in module.parameters():
         p.requires_grad_(False)
@@ -112,11 +137,16 @@ class AlignedWMLLM(nn.Module):
         self.device = torch.device(
             device if torch.cuda.is_available() else "cpu"
         )
-        # Fusion / conditioning knobs (caller overrides post-construction;
-        # tuned only on an independent val set — spec §2.2 / §6 red line).
-        self.alpha = 0.5            # verifier weight when doctests present
+        # Fusion / conditioning knobs (caller or align_config overrides;
+        # tuned only on an independent val/dev set — spec §2.2 / §6 red line).
+        self.alpha = 0.5            # legacy weight (bench --fuse-alpha)
+        self.alpha_pos = 0.85       # has_doctest verifier-dominant weight (val)
         self.cond_signal = "both"   # "z1" | "goal" | "both" (ablation e)
-        self.w_self_test = 0.0      # P1 self-proposed-test term (off)
+        self.w_self_test = 0.0      # self-proposed-test term w_t (val; off)
+        self.verifier_temp = 1.0    # OutcomeHead sigmoid temperature (val)
+        self.use_consistency = True  # verifier×consistency backup (P1-C)
+        self.w_consistency = 0.3    # consistency term weight (val)
+        self.soft_jitter = 0.1      # path-A per-candidate soft jitter (P1-D)
         self.test_proposer = None
         self.max_obs_chars = 4000
 
@@ -238,10 +268,25 @@ class AlignedWMLLM(nn.Module):
             self.projector.load_state_dict(proj, strict=False)
         cfg_path = d / "align_config.json" if d.is_dir() else None
         if cfg_path is not None and cfg_path.exists():
-            meta = json.loads(cfg_path.read_text(encoding="utf-8"))
-            self.cond_signal = meta.get("cond_signal", self.cond_signal)
+            self._apply_align_config(cfg_path)
         self._load_lora(d)
         self._load_outcome_head(d)
+
+    def _apply_align_config(self, cfg_path: Path) -> None:
+        """Read calibration keys (spec §3 R6; backward compatible)."""
+        meta = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.cond_signal = meta.get("cond_signal", self.cond_signal)
+        self.verifier_temp = float(
+            meta.get("verifier_temp", self.verifier_temp)
+        )
+        self.alpha_pos = float(meta.get("alpha_pos", self.alpha_pos))
+        self.w_self_test = float(meta.get("w_t", self.w_self_test))
+        self.w_consistency = float(
+            meta.get("w_consistency", self.w_consistency)
+        )
+        self.use_consistency = bool(
+            meta.get("use_consistency", self.use_consistency)
+        )
 
     def _load_lora(self, d: Path) -> None:
         lora = d / "lora" if d.is_dir() else None
@@ -313,17 +358,58 @@ class AlignedWMLLM(nn.Module):
             add_generation_prompt=True,
         )
 
+    def _chat_part_ids(self, prompt: str):
+        """Split the chat into (user-turn ids, assistant-prompt ids).
+
+        Soft tokens must sit BETWEEN the user turn and the assistant
+        generation prompt (LLaVA-style context), not after it — placing
+        them after ``<|im_start|>assistant\\n`` makes them occupy the
+        answer's first positions, so generation starts mid-token and
+        drops the leading ``def`` (the path-A collapse). Returns ids on
+        device; ``gen_ids`` is the suffix ``add_generation_prompt`` adds.
+        """
+        msgs = [{"role": "system", "content": _SYS_MSG},
+                {"role": "user", "content": _user_msg(prompt)}]
+        full = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        nogen = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False)
+        full_ids = self.tokenizer(full, return_tensors="pt").input_ids
+        nogen_ids = self.tokenizer(nogen, return_tensors="pt").input_ids
+        n = nogen_ids.size(1)
+        if not torch.equal(full_ids[:, :n], nogen_ids):
+            # Template did not simply append — fall back to no split.
+            ids = full_ids.to(self.device)
+            return ids, ids[:, :0]
+        return nogen_ids.to(self.device), full_ids[:, n:].to(self.device)
+
     def _prefix_embeds(self, prompt: str, soft: torch.Tensor):
-        """[chat(problem) embeds ⊕ soft] → (inputs_embeds, attn, L, K)."""
+        """[user-turn ⊕ soft ⊕ assistant-prompt] for a ``(B, K_s, d)`` soft
+        batch → ``(embeds, attn, L, K_s)``. ``B`` may be ``k`` (path A)."""
         embed = self.llm.get_input_embeddings()
-        chat = self._format_chat(prompt)
-        ids = self.tokenizer(chat, return_tensors="pt").input_ids
-        ids = ids.to(self.device)
-        p_emb = embed(ids)
-        soft = soft.to(p_emb.dtype)
-        inp = torch.cat([p_emb, soft], dim=1)
+        pre_ids, gen_ids = self._chat_part_ids(prompt)
+        b = soft.size(0)
+        pre_emb = embed(pre_ids).expand(b, -1, -1)
+        gen_emb = embed(gen_ids).expand(b, -1, -1)
+        soft = soft.to(pre_emb.dtype)
+        inp = torch.cat([pre_emb, soft, gen_emb], dim=1)
         attn = torch.ones(inp.shape[:2], dtype=torch.long, device=self.device)
-        return inp, attn, ids.size(1), soft.size(1)
+        return inp, attn, inp.size(1), soft.size(1)
+
+    def _perturb_soft(self, soft: torch.Tensor, k: int) -> torch.Tensor:
+        """Per-candidate jittered copies of a ``(1, K_s, d)`` soft prefix →
+        ``(k, K_s, d)``. Candidate 0 keeps the clean soft; the rest add
+        Gaussian jitter scaled by the soft's own std, so the ``k`` candidates
+        condition on distinct (but near) predicted consequences — killing the
+        round-4 shared-prefix mode collapse (spec §2.4.3 / P1-D)."""
+        if k <= 1:
+            return soft
+        base = soft.float()
+        std = base.std().clamp_min(1e-4) * self.soft_jitter
+        rows = [base]
+        for _ in range(k - 1):
+            rows.append(base + torch.randn_like(base) * std)
+        return torch.cat(rows, dim=0).to(soft.dtype)
 
     def generate_conditioned(
         self,
@@ -334,12 +420,15 @@ class AlignedWMLLM(nn.Module):
         temperature: float,
         max_new_tokens: int,
     ) -> list[tuple[str, float]]:
-        """Path A — sample ``k`` candidates conditioned on the WM soft
-        tokens. Executes nothing. Returns ``[(text, mean_logprob)]``.
+        """Path A — sample ``k`` candidates, each conditioned on its own
+        jittered WM soft prefix (anti-collapse; spec §2.4.3). Signature
+        unchanged (single ``draft``). Executes nothing. Returns
+        ``[(text, mean_logprob)]`` of length ``k``.
         """
         z1 = self.predict_outcome_latent(prompt, [draft])  # (1, d_wm)
-        soft = self._cond_soft(z1)                          # (1, K, d_llm)
-        inp, attn, _l, _k = self._prefix_embeds(prompt, soft)
+        soft = self._cond_soft(z1)                          # (1, K_s, d_llm)
+        soft = self._perturb_soft(soft, k)                  # (k, K_s, d_llm)
+        inp, attn, _l, _ks = self._prefix_embeds(prompt, soft)
         do_sample = temperature > 0
         with torch.no_grad():
             out = self.llm.generate(
@@ -348,7 +437,7 @@ class AlignedWMLLM(nn.Module):
                 do_sample=do_sample,
                 temperature=temperature if do_sample else 1.0,
                 top_p=0.95 if do_sample else 1.0,
-                num_return_sequences=k,
+                num_return_sequences=1,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
@@ -384,32 +473,50 @@ class AlignedWMLLM(nn.Module):
     # -- path B: fused predictive rerank --------------------------------
 
     def _verifier_scores(self, z1: torch.Tensor) -> torch.Tensor:
+        """Calibrated verifier P(pass) = sigmoid(logit / T) (spec §2.3.3)."""
         head = getattr(self.wm, "outcome_head", None)
         if head is None:
             return torch.zeros(z1.size(0))
         logit = head(z1).squeeze(-1)
-        return torch.sigmoid(logit).float().cpu()
+        temp = max(float(self.verifier_temp), 1e-3)
+        return torch.sigmoid(logit / temp).float().cpu()
+
+    def verifier_logits(
+        self, prompt: str, programs: list[str]
+    ) -> torch.Tensor:
+        """Raw OutcomeHead logits per candidate (pre-temperature).
+
+        Used by ``calibrate_verifier`` to fit the temperature on an
+        independent val set (spec §2.3.3); never executes anything.
+        """
+        z1 = self.predict_outcome_latent(prompt, programs)
+        head = getattr(self.wm, "outcome_head", None)
+        if head is None:
+            return torch.zeros(len(programs))
+        return head(z1).squeeze(-1).float().cpu()
 
     def _cond_logprob(
         self, prompt: str, completion: str, soft: torch.Tensor
     ) -> float:
-        """Mean per-token logp of ``completion`` under [chat ⊕ soft]."""
+        """Mean per-token logp of ``completion`` under
+        [user-turn ⊕ soft ⊕ assistant-prompt ⊕ completion] — soft sits
+        before the generation prompt, matching ``generate_conditioned``.
+        """
         embed = self.llm.get_input_embeddings()
-        chat = self._format_chat(prompt)
-        p_ids = self.tokenizer(chat, return_tensors="pt").input_ids
+        pre_ids, gen_ids = self._chat_part_ids(prompt)
         c_ids = self.tokenizer(
             completion, return_tensors="pt", add_special_tokens=False
-        ).input_ids
-        p_ids, c_ids = p_ids.to(self.device), c_ids.to(self.device)
+        ).input_ids.to(self.device)
         if c_ids.size(1) == 0:
             return 0.0
-        p_emb, c_emb = embed(p_ids), embed(c_ids)
-        soft = soft.to(p_emb.dtype)
-        inp = torch.cat([p_emb, soft, c_emb], dim=1)
+        pre_emb, gen_emb = embed(pre_ids), embed(gen_ids)
+        c_emb = embed(c_ids)
+        soft = soft.to(pre_emb.dtype)
+        inp = torch.cat([pre_emb, soft, gen_emb, c_emb], dim=1)
         attn = torch.ones(inp.shape[:2], dtype=torch.long, device=self.device)
         with torch.no_grad():
             logits = self.llm(inputs_embeds=inp, attention_mask=attn).logits[0]
-        start = p_ids.size(1) + soft.size(1)
+        start = pre_ids.size(1) + soft.size(1) + gen_ids.size(1)
         m = c_ids.size(1)
         sel = logits[start - 1: start - 1 + m].float()
         lp = torch.log_softmax(sel, dim=-1)
@@ -428,8 +535,12 @@ class AlignedWMLLM(nn.Module):
     def _self_test_scores(
         self, prompt: str, programs: list[str]
     ) -> torch.Tensor:
-        """P1 (spec §2.2 ``w_t``): predict pass on LLM self-proposed tests."""
-        if self.w_self_test <= 0 or self.test_proposer is None:
+        """Predicted pass on LLM self-proposed tests (spec §2.2 ``w_t``).
+
+        Weight gating lives in the fusion; here we only require a proposer
+        (so calibrate can cache this term even while ``w_t == 0``).
+        """
+        if self.test_proposer is None:
             return torch.zeros(len(programs))
         tests = self.test_proposer.propose(prompt)
         if not tests:
@@ -438,6 +549,72 @@ class AlignedWMLLM(nn.Module):
         z1 = self.predict_outcome_latent(prompt, [p + suffix for p in programs])
         return self._verifier_scores(z1)
 
+    def _consistency_scores(
+        self, programs: list[str], v_prob: torch.Tensor
+    ) -> torch.Tensor:
+        """Vote-weighted predicted pass (spec §2.2 P1-C): normalised majority
+        cluster weight × verifier P(pass). 0 if disabled / single candidate."""
+        if not self.use_consistency or len(programs) <= 1:
+            return torch.zeros(len(programs))
+        canon = [_ast_canonical(p) for p in programs]
+        counts = Counter(canon)
+        k = float(len(programs))
+        votes = torch.tensor(
+            [counts[c] / k for c in canon], dtype=torch.float32
+        )
+        return votes * v_prob
+
+    def _fusion_weights(self, n_doctests: int) -> tuple[float, float]:
+        """(verifier, likelihood) weights by subset gate (spec §2.2)."""
+        if n_doctests > 0:
+            return self.alpha_pos, 1.0 - self.alpha_pos
+        return 0.0, 1.0
+
+    def _score_terms(
+        self, prompt: str, programs: list[str],
+        completions: list[str] | None, *, force_self_test: bool = False,
+    ) -> dict:
+        """Raw per-candidate signal vectors (cached by calibrate; spec §2.2)."""
+        z1 = self.predict_outcome_latent(prompt, programs)  # (N, d_wm)
+        v_prob = self._verifier_scores(z1)
+        texts = completions if completions is not None else programs
+        want_self = force_self_test or (
+            self.w_self_test > 0 and self.test_proposer is not None
+        )
+        self_test = (
+            self._self_test_scores(prompt, programs)
+            if want_self else torch.zeros(len(programs))
+        )
+        return {
+            "verifier": v_prob,
+            "likelihood": self._likelihood_scores(prompt, texts, z1),
+            "self_test": self_test,
+            "consistency": self._consistency_scores(programs, v_prob),
+        }
+
+    def _fuse_terms(self, terms: dict, n_doctests: int) -> torch.Tensor:
+        """Combine z-scored terms by the subset gate + non-destructive
+        guardrail. When the guardrail forces ``alpha_pos>=1`` on a has_doctest
+        item the score is the pure verifier ranking — mathematically ≥
+        verifier-only, so has_doctest can never regress (spec §2.2 / §7).
+
+        The consistency term (verifier × vote weight) only carries signal
+        where the verifier does, so it is applied on has_doctest only; the
+        no_doctest gate stays conditional-likelihood-dominant to preserve the
+        round-4 OOD gain (spec §2.2 / §7.5, impl finding D4).
+        """
+        if n_doctests > 0 and self.alpha_pos >= 1.0:
+            return _zscore(terms["verifier"])
+        w_v, w_l = self._fusion_weights(n_doctests)
+        score = (
+            w_v * _zscore(terms["verifier"])
+            + w_l * terms["likelihood"]
+            + self.w_self_test * _zscore(terms["self_test"])
+        )
+        if n_doctests > 0:
+            score = score + self.w_consistency * _zscore(terms["consistency"])
+        return score
+
     def score_candidate(
         self,
         prompt: str,
@@ -445,25 +622,18 @@ class AlignedWMLLM(nn.Module):
         n_doctests: int = 0,
         completions: list[str] | None = None,
     ) -> list[float]:
-        """Path B — fused score per candidate (no execution).
+        """Path B — fused score per candidate (no execution; spec §2.2).
 
-        ``score = w_v·verifier + w_l·zscore(cond_logp) + w_t·self_test``,
-        auto-gated by ``n_doctests`` (spec §2.2): with visible doctests the
-        verifier term gets weight ``alpha``; without, the score falls back
-        entirely to the dense conditional likelihood. ``completions`` are
-        the raw candidate texts whose likelihood is scored (defaults to the
-        assembled ``programs`` when not supplied).
+        ``score = w_v·zscore(sigmoid(logit/T)) + w_l·zscore(cond_logp)
+                  + w_t·zscore(self_test) + w_c·zscore(consistency)``,
+        gated by ``n_doctests`` (has_doctest → verifier-dominant
+        ``alpha_pos``; no_doctest → conditional likelihood). All terms are
+        z-scored so ``alpha_pos`` is a true mixing weight (spec §2.2 P1-A);
+        the guardrail keeps the has_doctest subset non-destructive.
+        ``completions`` are the raw candidate texts whose likelihood is
+        scored (defaults to ``programs``).
         """
         if not programs:
             return []
-        z1 = self.predict_outcome_latent(prompt, programs)  # (N, d_wm)
-        verifier = self._verifier_scores(z1)
-        texts = completions if completions is not None else programs
-        likelihood = self._likelihood_scores(prompt, texts, z1)
-        self_test = self._self_test_scores(prompt, programs)
-        if n_doctests > 0:
-            w_v, w_l = self.alpha, 1.0 - self.alpha
-        else:
-            w_v, w_l = 0.0, 1.0
-        score = w_v * verifier + w_l * likelihood + self.w_self_test * self_test
-        return score.tolist()
+        terms = self._score_terms(prompt, programs, completions)
+        return self._fuse_terms(terms, n_doctests).tolist()

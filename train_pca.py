@@ -49,14 +49,26 @@ def _build_dataset(cfg, split: str) -> TrajectoryDataset:
     return TrajectoryDataset(ds_cfg)
 
 
+def _maybe_balanced_sampler(cfg, train_set):
+    """Stage-0 pass/fail class-balancing sampler (spec §2.3.1); else None."""
+    stage = cfg.experiment.get("stage", "stage0")
+    if stage != "stage0" or not cfg.data.get("class_balance", False):
+        return None
+    from pca.training.llava_stages import class_balanced_sampler
+
+    return class_balanced_sampler(train_set, seed=cfg.seed)
+
+
 def _build_loaders(cfg) -> tuple:
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set = _build_dataset(cfg, "train")
     val_set = _build_dataset(cfg, "val")
     loader_kwargs = OmegaConf.to_container(cfg.loader, resolve=True)
+    sampler = _maybe_balanced_sampler(cfg, train_set)
     train = torch.utils.data.DataLoader(
         train_set,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         drop_last=True,
         collate_fn=collate_trajectories,
         generator=rnd_gen,
@@ -267,6 +279,10 @@ def _stage_meta(cfg, stage: str) -> dict:
         "num_tokens": proj.get("num_tokens", 4),
         "cond_signal": cfg.model.get("cond_signal", "both"),
         "alpha": cfg.model.get("alpha", 0.5),
+        # R5 fusion knobs (spec §3 / §2.2); calibrate_verifier overwrites.
+        "alpha_pos": cfg.model.get("alpha_pos", 0.85),
+        "verifier_temp": cfg.model.get("verifier_temp", 1.0),
+        "w_t": cfg.model.get("w_t", 0.0),
         "llm_name": cfg.model.llm_name,
         "wm_config": cfg.model.get("wm_config_name", "wm_humaneval"),
     }

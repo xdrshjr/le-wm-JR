@@ -69,8 +69,12 @@ loss:
     weight: 0.5
 
 data:
-  path: data/trajectories/humaneval_wm_v1
+  # R5 strong verifier: expanded trajectories (>=400 problems x k8) +
+  # pass/fail class balancing, ckpt selected by val-AUROC (spec §2.3.1).
+  path: data/trajectories/humaneval_wm_v2
   max_obs_chars: 4000
+  class_balance: true   # WeightedRandomSampler over pass/fail (Stage-0)
+  select_by: val_auroc  # documented selection metric (select_best inline)
 
 wandb:
   enabled: false

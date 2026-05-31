@@ -141,13 +141,12 @@ def _outcome_enabled(cfg) -> bool:
     return bool(outcome) and bool(outcome.get("enabled", False))
 
 
-def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
-    """Val AUROC of P(pass) vs. binarized label (status==PASS); spec §6.2."""
-    if getattr(model, "outcome_head", None) is None:
-        return None
+def _outcome_scores_labels(model, loader, ctx_len: int, device, temp=1.0):
+    """Collect calibrated P(pass)=sigmoid(logit/T) + binarized labels."""
     model.eval()
     scores: list[float] = []
     labels: list[int] = []
+    t = max(float(temp), 1e-3)
     with torch.no_grad():
         for batch in loader:
             label = batch.get("label")
@@ -158,11 +157,38 @@ def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
             act_emb = info["act_emb"].to(device)
             pred_emb = model.predict(emb[:, :ctx_len], act_emb[:, :ctx_len])
             logit = model.outcome_head(pred_emb[:, -1]).squeeze(-1)
-            scores.extend(torch.sigmoid(logit).float().cpu().tolist())
+            scores.extend(torch.sigmoid(logit / t).float().cpu().tolist())
             labels.extend(
                 1 if v >= 1.0 - 1e-6 else 0 for v in label.tolist()
             )
+    return scores, labels
+
+
+def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
+    """Val AUROC of P(pass) vs. binarized label (status==PASS); spec §6.2."""
+    if getattr(model, "outcome_head", None) is None:
+        return None
+    scores, labels = _outcome_scores_labels(model, loader, ctx_len, device)
     return _auroc(scores, labels)
+
+
+def _ece(scores: list[float], labels: list[int], n_bins: int = 10):
+    """Expected Calibration Error (reliability); ``None`` if empty (P1)."""
+    import numpy as np
+
+    if not scores:
+        return None
+    s = np.asarray(scores, dtype=float)
+    y = np.asarray(labels, dtype=float)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    total, n = 0.0, float(len(s))
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        m = (s > lo) & (s <= hi) if i > 0 else (s >= lo) & (s <= hi)
+        if m.sum() == 0:
+            continue
+        total += (m.sum() / n) * abs(float(y[m].mean()) - float(s[m].mean()))
+    return float(total)
 
 
 # ----- Stage-1 alignment quality (wm-llm-alignment §6, P1) -------------
@@ -337,7 +363,15 @@ def run(cfg):
             device=device,
         )
         payload["auroc"] = auroc
-        auroc_msg = f" auroc={auroc}"
+        # Calibrated reliability (spec §3 P1): ECE at the configured verifier
+        # temperature (1.0 = uncalibrated). Pure-additive fields.
+        temp = float(cfg.get("verifier_temp", 1.0))
+        sc, lab = _outcome_scores_labels(
+            model, loader, cfg.wm.history_size, device, temp
+        )
+        payload["ece"] = _ece(sc, lab)
+        payload["verifier_temp"] = temp
+        auroc_msg = f" auroc={auroc} ece={payload['ece']}"
 
     # Stage-1 alignment quality — additive, only when align_ckpt+pairs set.
     align = _eval_alignment_quality(cfg, model, device)

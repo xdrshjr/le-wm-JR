@@ -61,6 +61,28 @@ def _run_test_op() -> RunTestArgs:
     return RunTestArgs(selector=_VISIBLE_SELECTOR, timeout_sec=_TIMEOUT_SEC)
 
 
+def class_balanced_sampler(dataset, seed: int = 0):
+    """WeightedRandomSampler balancing pass/fail windows for a Stage-0
+    ``TrajectoryDataset`` so the verifier ``OutcomeHead`` sees both classes
+    evenly (spec §2.3.1). Returns ``None`` when the data is single-class.
+    """
+    from torch.utils.data import WeightedRandomSampler
+
+    labels: list[int] = []
+    for tid, offset in dataset._index:
+        lab = dataset._trajectories[tid].steps[offset].label
+        labels.append(1 if (lab is not None and lab >= 1.0 - 1e-6) else 0)
+    n_pos = sum(labels)
+    n_neg = len(labels) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return None
+    weights = [0.5 / n_pos if y else 0.5 / n_neg for y in labels]
+    gen = torch.Generator().manual_seed(seed)
+    return WeightedRandomSampler(
+        weights, num_samples=len(weights), replacement=True, generator=gen
+    )
+
+
 def info_nce(
     p: torch.Tensor, t: torch.Tensor, tau: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -252,12 +274,27 @@ class InstructStage2Module(pl.LightningModule):
         )
         return tok, get_peft_model(base, lora)
 
-    def _format_chat(self, prompt: str) -> str:
-        return self.tokenizer.apply_chat_template(
-            [{"role": "system", "content": _SYS_MSG},
-             {"role": "user", "content": _user_msg(prompt)}],
-            tokenize=False, add_generation_prompt=True,
-        )
+    def _chat_part_ids(self, prompt: str):
+        """(user-turn ids, assistant-gen-prompt ids) on device.
+
+        Soft tokens are inserted BETWEEN these, matching the inference
+        contract (``aligned_model._chat_part_ids``). Round-4 trained with
+        soft AFTER the generation prompt — the opposite position — which is
+        the most likely cause of the path-A collapse (spec §2.4.0 / P0-1).
+        """
+        msgs = [{"role": "system", "content": _SYS_MSG},
+                {"role": "user", "content": _user_msg(prompt)}]
+        full = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True)
+        nogen = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False)
+        full_ids = self.tokenizer(full, return_tensors="pt").input_ids
+        nogen_ids = self.tokenizer(nogen, return_tensors="pt").input_ids
+        n = nogen_ids.size(1)
+        if not torch.equal(full_ids[:, :n], nogen_ids):
+            ids = full_ids.to(self.device)
+            return ids, ids[:, :0]
+        return nogen_ids.to(self.device), full_ids[:, n:].to(self.device)
 
     def _predict_z1(
         self, prompts: list[str], drafts: list[str]
@@ -277,21 +314,26 @@ class InstructStage2Module(pl.LightningModule):
         return z1.detach().float()
 
     def _row_embeds(self, prompt: str, gold: str, soft: torch.Tensor):
-        """One (embeds, labels) row: [chat ⊕ soft ⊕ gold], CE on gold."""
+        """One (embeds, labels): [user ⊕ soft ⊕ gen-prompt ⊕ gold].
+
+        Soft sits before the assistant generation prompt so training matches
+        inference (spec §2.4.0 / P0-1); CE is computed only on the gold span.
+        """
         embed = self.llm.get_input_embeddings()
-        p_ids = self.tokenizer(
-            self._format_chat(prompt), return_tensors="pt"
-        ).input_ids.to(self.device)
+        pre_ids, gen_ids = self._chat_part_ids(prompt)
         g_ids = self.tokenizer(
             gold + self.tokenizer.eos_token, return_tensors="pt",
             add_special_tokens=False,
         ).input_ids.to(self.device)
         s = soft.to(embed.weight.dtype)
-        emb = torch.cat([embed(p_ids)[0], s, embed(g_ids)[0]], dim=0)
+        emb = torch.cat(
+            [embed(pre_ids)[0], s, embed(gen_ids)[0], embed(g_ids)[0]], dim=0
+        )
         lab = torch.full(
             (emb.size(0),), -100, dtype=torch.long, device=self.device
         )
-        lab[p_ids.size(1) + s.size(0):] = g_ids[0]
+        start = pre_ids.size(1) + s.size(0) + gen_ids.size(1)
+        lab[start:] = g_ids[0]
         return emb, lab
 
     def _pack(self, problems, golds, soft):

@@ -61,6 +61,11 @@ model:
   wm_config_name: wm_humaneval
   cond_signal: both
   alpha: 0.5
+  # R5 fusion knobs written into align_config.json (spec §3 / §2.2). These
+  # are initial values; calibrate_verifier overwrites them on the dev set.
+  alpha_pos: 0.85       # has_doctest verifier-dominant weight
+  verifier_temp: 1.0    # OutcomeHead sigmoid temperature
+  w_t: 0.0              # self-proposed-test weight (default off; P1-F)
   projector:
     hidden_dim: 1024
     out_dim: 1536
@@ -75,7 +80,7 @@ loss:
     weight: 0.5  # μ — auxiliary verifier BCE (spec §2.4 L2)
 
 data:
-  path: data/align/v1  # instruct.jsonl from build_alignment_data
+  path: data/align/v2  # instruct.jsonl from build_alignment_data (R5)
   val_frac: 0.1
 
 wandb:

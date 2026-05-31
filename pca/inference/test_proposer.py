@@ -45,6 +45,9 @@ class TestProposer:
         self.n_tests = n_tests
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # Per-problem cache: the same prompt recurs across K candidates and
+        # multiple seeds, so propose once and reuse (spec §3 P1, no re-gen).
+        self._cache: dict[str, list[str]] = {}
 
     def _chat(self, prompt: str) -> str:
         user = _user_msg(prompt).replace("{n}", str(self.n_tests))
@@ -55,7 +58,12 @@ class TestProposer:
         )
 
     def propose(self, prompt: str) -> list[str]:
-        """Return up to ``n_tests`` proposed assert statements (no exec)."""
+        """Return up to ``n_tests`` proposed assert statements (no exec).
+
+        Cached per prompt so repeated candidates / seeds don't re-generate.
+        """
+        if prompt in self._cache:
+            return self._cache[prompt]
         import torch
 
         chat = self._chat(prompt)
@@ -73,13 +81,22 @@ class TestProposer:
             )
         new = out[0, inputs["input_ids"].shape[1]:]
         text = self.tokenizer.decode(new, skip_special_tokens=True)
-        return self._parse_asserts(text)
+        asserts = self._parse_asserts(text)
+        self._cache[prompt] = asserts
+        return asserts
 
     def _parse_asserts(self, text: str) -> list[str]:
+        """Extract de-duplicated ``assert`` lines, ignoring markdown fences."""
         asserts: list[str] = []
+        seen: set[str] = set()
         for line in text.splitlines():
-            if _ASSERT_LINE.match(line):
-                asserts.append(line.strip())
+            stripped = line.strip()
+            if stripped.startswith("```") or not _ASSERT_LINE.match(line):
+                continue
+            if stripped in seen:
+                continue
+            seen.add(stripped)
+            asserts.append(stripped)
             if len(asserts) >= self.n_tests:
                 break
         return asserts
