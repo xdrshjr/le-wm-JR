@@ -78,6 +78,43 @@ def format_result(
     )
 
 
+# R3 (spec §2.4): the discriminative ``TEST:`` segment is placed BEFORE the
+# (often long) ``CANDIDATE:`` segment, and the candidate is capped, so that
+# under the MiniLM ~512-token / ``max_obs_chars`` window only the candidate
+# tail (lowest-information) can be truncated — PROBLEM/TEST/ACTION always
+# survive. ``serialize_test`` is the single source of truth shared verbatim
+# by ``gen_mbpp_traj`` (training) and PEC inference (spec §2.4 invariant 2).
+_PROG_CAP = 1600  # chars; PROBLEM/TEST are short, leave headroom for candidate
+
+
+def serialize_test(prompt: str, program: str, test: str) -> str:
+    """Per-test observation: predict whether ``program`` passes ``test``.
+
+    Field order PROBLEM→TEST→CANDIDATE→ACTION keeps the discriminative TEST
+    segment truncation-safe (spec §2.4 / R3). Shared verbatim by the MBPP
+    per-test collector and the PEC reranker (train == test distribution).
+    """
+    prog = program if len(program) <= _PROG_CAP else program[:_PROG_CAP]
+    return (
+        f"PROBLEM:\n{prompt}\n"
+        f"TEST:\n{test}\n"
+        f"CANDIDATE:\n{prog}\n"
+        f"ACTION: run this test"
+    )
+
+
+# Canonical single-test "passed" result string (per-test step1 obs_text).
+PASS_TEMPLATE = "RESULT: test passed; status=PASS; first_error: none"
+
+
+def format_test_result(passed: bool, err: str | None = None) -> str:
+    """Build the post-execution result text for a single test (spec §2.4)."""
+    if passed:
+        return PASS_TEMPLATE
+    e = (err or "none").replace("\n", " ").strip()[:200] or "none"
+    return f"RESULT: test failed; status=FAIL; first_error: {e}"
+
+
 def _run_test_op() -> RunTestArgs:
     return RunTestArgs(selector=_VISIBLE_SELECTOR, timeout_sec=_TIMEOUT_SEC)
 
@@ -91,6 +128,7 @@ class WMRerankerConfig:
     score_mode: str = "verifier"  # "verifier" | "goal_dist"
     device: str = "cuda"
     max_obs_chars: int = 4000
+    verifier_temp: float = 1.0  # sigmoid temperature for score_matrix (PEC)
 
 
 def _maybe_autocast(device: torch.device):
@@ -237,3 +275,34 @@ class WMReranker:
             diff = z1 - self._z_goal  # (K, D) broadcast over (1, D)
             scores = -(diff.pow(2).sum(dim=-1))
         return scores.detach().cpu().tolist()
+
+    def score_matrix(
+        self, prompt: str, programs: list[str], tests: list[str],
+        *, temp: float | None = None, return_logits: bool = False,
+    ) -> "torch.Tensor":
+        """(K, T) predicted P(candidate passes test); **zero execution**.
+
+        For every ``(program, test)`` pair build the per-test observation
+        via ``serialize_test`` (TEST-before-CANDIDATE, truncation-safe; R3)
+        and run a single batched ``_encode`` + OutcomeHead forward. Empty
+        ``tests`` → ``(K, 0)`` so the caller falls back to logprob argmax
+        (spec §2.2(b) / §4.2). ``return_logits`` yields raw pre-temperature
+        logits (calibration); otherwise ``sigmoid(logit / temp)``.
+        """
+        k, t = len(programs), len(tests)
+        if k == 0 or t == 0:
+            return torch.zeros((k, t))
+        head = getattr(self.model, "outcome_head", None)
+        if head is None:
+            raise RuntimeError("score_matrix requires a trained outcome_head")
+        texts = [
+            serialize_test(prompt, prog, tst)
+            for prog in programs for tst in tests
+        ]
+        z1 = self._encode(texts)  # (K*T, D)
+        logits = head(z1).squeeze(-1).view(k, t)  # (K, T)
+        if return_logits:
+            return logits.detach().cpu()
+        tv = self.cfg.verifier_temp if temp is None else temp
+        tv = max(float(tv), 1e-3)
+        return torch.sigmoid(logits / tv).detach().cpu()

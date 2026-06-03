@@ -1,5 +1,12 @@
 """calibrate_verifier — fit the verifier temperature + fusion weights.
 
+Round-6 note (spec §3 R1): the headline ``--wm-score consensus`` path now
+calibrates ``theta`` / ``consensus_mode`` / ``verifier_temp`` via the
+self-contained ``calibrate_consensus.py`` (writes ``consensus_config.json``,
+needs no aligned model). This script is **kept only for the ``fused`` /
+``pca_align`` ablations**, which still depend on ``--aligned-ckpt`` +
+instruct-val + ``AlignedWMLLM`` and write ``align_config.json``.
+
 Two independent, leakage-free calibrations (spec §2.5 step 4 / P0-2):
 
   (a) temperature ``T`` — on the instruct val split (single draft +

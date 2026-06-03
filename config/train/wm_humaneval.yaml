@@ -69,9 +69,13 @@ loss:
     weight: 0.5
 
 data:
-  # R5 strong verifier: expanded trajectories (>=400 problems x k8) +
-  # pass/fail class balancing, ckpt selected by val-AUROC (spec §2.3.1).
-  path: data/trajectories/humaneval_wm_v2
+  # R6 PEC (zero-exec CodeT): per-test trajectories — one binary-label
+  # sample per (candidate, single assert) so training granularity ==
+  # inference granularity (spec §2.3). class_balance fits the naturally
+  # binary per-test label; ckpt selected by per-test val-AUROC (target
+  # >=0.75). v2 (ratio-label) is still loadable for the verifier/fused
+  # ablations by overriding data.path on the CLI.
+  path: data/trajectories/humaneval_wm_v3_pertest
   max_obs_chars: 4000
   class_balance: true   # WeightedRandomSampler over pass/fail (Stage-0)
   select_by: val_auroc  # documented selection metric (select_best inline)

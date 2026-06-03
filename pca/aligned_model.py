@@ -144,6 +144,11 @@ class AlignedWMLLM(nn.Module):
         self.cond_signal = "both"   # "z1" | "goal" | "both" (ablation e)
         self.w_self_test = 0.0      # self-proposed-test term w_t (val; off)
         self.verifier_temp = 1.0    # OutcomeHead sigmoid temperature (val)
+        # PEC consensus knobs (spec §3 R6; only read if align_config carries
+        # them — fused/pca_align stay byte-identical when they are absent).
+        self.theta = 0.5            # consensus pass threshold (hard mode)
+        self.consensus_mode = "soft"
+        self.w_l = 0.0              # optional cond-likelihood fusion weight
         self.use_consistency = True  # verifier×consistency backup (P1-C)
         self.w_consistency = 0.3    # consistency term weight (val)
         self.soft_jitter = 0.1      # path-A per-candidate soft jitter (P1-D)
@@ -287,6 +292,10 @@ class AlignedWMLLM(nn.Module):
         self.use_consistency = bool(
             meta.get("use_consistency", self.use_consistency)
         )
+        # Optional PEC keys (spec §3 R6): default-safe, backward compatible.
+        self.theta = float(meta.get("theta", self.theta))
+        self.consensus_mode = meta.get("consensus_mode", self.consensus_mode)
+        self.w_l = float(meta.get("w_l", self.w_l))
 
     def _load_lora(self, d: Path) -> None:
         lora = d / "lora" if d.is_dir() else None
@@ -494,6 +503,25 @@ class AlignedWMLLM(nn.Module):
         if head is None:
             return torch.zeros(len(programs))
         return head(z1).squeeze(-1).float().cpu()
+
+    def predict_pass_matrix(
+        self, prompt: str, programs: list[str], tests: list[str]
+    ) -> torch.Tensor:
+        """(K, T) predicted P(candidate passes test) for PEC reuse (spec §3
+        P1). Mirrors ``WMReranker.score_matrix`` via the shared
+        ``serialize_test`` observation; executes nothing. Lets the consensus
+        path / repair loop reuse the aligned model's verifier head."""
+        from pca.inference.wm_reranker import serialize_test
+
+        k, t = len(programs), len(tests)
+        if k == 0 or t == 0:
+            return torch.zeros((k, t))
+        texts = [
+            serialize_test(prompt, p, tst)
+            for p in programs for tst in tests
+        ]
+        z1 = self._encode_latent(texts)  # (K*T, d_wm)
+        return self._verifier_scores(z1).view(k, t)
 
     def _cond_logprob(
         self, prompt: str, completion: str, soft: torch.Tensor

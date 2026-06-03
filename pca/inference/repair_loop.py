@@ -51,6 +51,20 @@ class RepairLoop:
         z1 = self.aligned.predict_outcome_latent(prompt, programs)
         return self.aligned._verifier_scores(z1)
 
+    def predicted_failing_tests(
+        self, prompt: str, program: str, tests: list[str], *, thr: float = 0.5,
+    ) -> list[str]:
+        """Tests the world model PREDICTS ``program`` fails (zero exec; spec
+        §3 P1 stretch). Reuses the PEC matrix
+        (``AlignedWMLLM.predict_pass_matrix``) so repair can be steered by the
+        concrete predicted-failing cases rather than a single global scalar.
+        """
+        if not tests:
+            return []
+        mat = self.aligned.predict_pass_matrix(prompt, [program], tests)
+        probs = mat[0].tolist()
+        return [t for t, p in zip(tests, probs) if p < thr]
+
     def _generate_repairs(self, problem: str, body: str) -> list[str]:
         tok = self.aligned.tokenizer
         chat = tok.apply_chat_template(

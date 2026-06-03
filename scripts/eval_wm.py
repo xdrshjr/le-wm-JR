@@ -165,7 +165,13 @@ def _outcome_scores_labels(model, loader, ctx_len: int, device, temp=1.0):
 
 
 def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
-    """Val AUROC of P(pass) vs. binarized label (status==PASS); spec §6.2."""
+    """Val AUROC of P(pass) vs. binarized label (status==PASS); spec §6.2.
+
+    On a per-test (``humaneval_wm_v3_pertest``) dataset every label is the
+    binary "did this candidate pass this single assert" target, so this is
+    the **per-test** AUROC the PEC gate (>=0.75) is selected on (spec §2.3).
+    On the legacy ratio-label data it is the global pass AUROC, unchanged.
+    """
     if getattr(model, "outcome_head", None) is None:
         return None
     scores, labels = _outcome_scores_labels(model, loader, ctx_len, device)
