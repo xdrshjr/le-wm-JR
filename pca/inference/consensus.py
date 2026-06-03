@@ -7,7 +7,7 @@ executed**). ``consensus_rank`` then reranks candidates with CodeT-style
 dual consistency (Chen et al., 2022) on that matrix, so a single mistaken
 prediction is averaged out by agreement across candidates and tests.
 
-Two modes (spec §2.2(c)):
+Three modes (spec §2.2(c) / §2.4):
   soft (default, R2-fixed): ``score(c) = (1/T)·Σ_t P[c,t]·Σ_c' P[c',t]`` —
       PASS-mass agreement only. A candidate scores high iff the tests it is
       predicted to pass are also predicted-passed by many other candidates.
@@ -16,6 +16,13 @@ Two modes (spec §2.2(c)):
       anti-CodeT and reproduces the round-5 "ranking anti-correlated with
       correctness" failure (spec R2). A candidate predicted to fail every
       test (P≈0) scores ≈0 and stays last.
+  soft_conf (round-7, spec §2.4 lever B): confidence-weighted soft. Each
+      prediction is weighted by ``w[c,t] = (2·|P[c,t]−0.5|)^γ`` so a
+      P≈0.5 (uncertain) prediction barely moves the consensus while a
+      P≈0.95 (confident) one drives it — predicted-pass noise stops
+      shattering the consensus signal. Same R2 invariant: only shared
+      *pass* mass is rewarded (no shared-failure term). An all-uncertain
+      matrix (total weight ≈ 0) falls back to log-probs.
   hard (ablation): CodeT original ``|S| × |y|`` on ``B = ⟦P ≥ theta⟧``,
       where ``|S|`` is the size of the consensus set sharing a candidate's
       pass signature and ``|y|`` its predicted-pass count.
@@ -46,6 +53,38 @@ def _soft_scores(rows: list[list[float]]) -> list[float]:
     ]
 
 
+def _soft_conf_scores(
+    rows: list[list[float]], gamma: float, logprobs,
+) -> list[float]:
+    """Confidence-weighted PASS-mass agreement (R2-fixed; spec §2.4).
+
+    ``w[c,t] = (2|P[c,t]-0.5|)^gamma`` ∈ [0,1] is each prediction's
+    confidence; the score is the soft consensus reweighted by it::
+
+        score(c) = (1/(Σ_t w[c,t]+ε))·Σ_t w[c,t]·P[c,t]·(Σ_c' w[c',t]·P[c',t])
+
+    Only shared *pass* mass is rewarded (守 R2 — no shared-failure term). A
+    matrix of all-uncertain predictions (total weight ≈ 0) degenerates to a
+    log-prob fallback, matching the ``T == 0`` contract.
+    """
+    k = len(rows)
+    t = len(rows[0])
+    eps = 1e-9
+    w = [
+        [(2.0 * abs(rows[c][j] - 0.5)) ** gamma for j in range(t)]
+        for c in range(k)
+    ]
+    if sum(w[c][j] for c in range(k) for j in range(t)) < eps:
+        return list(logprobs) if logprobs is not None else [0.0] * k
+    wcol = [sum(w[c][j] * rows[c][j] for c in range(k)) for j in range(t)]
+    scores = []
+    for c in range(k):
+        denom = sum(w[c][j] for j in range(t)) + eps
+        num = sum(w[c][j] * rows[c][j] * wcol[j] for j in range(t))
+        scores.append(num / denom)
+    return scores
+
+
 def _hard_scores(rows: list[list[float]], theta: float) -> list[float]:
     """CodeT original ``|S| × |y|`` on the thresholded pass matrix."""
     t = len(rows[0])
@@ -59,6 +98,7 @@ def _hard_scores(rows: list[list[float]], theta: float) -> list[float]:
 
 def consensus_rank(
     matrix, logprobs, *, theta: float = 0.5, mode: str = "soft",
+    gamma: float = 1.0,
 ) -> list[float]:
     """CodeT consensus score per candidate from a ``(K, T)`` prob matrix.
 
@@ -66,6 +106,11 @@ def consensus_rank(
     the argmax and breaks ties by ``logprobs`` (spec §4.2). When ``T == 0``
     the caller is expected to skip this call, but as a safety net the raw
     ``logprobs`` are returned so a degenerate matrix never crashes ranking.
+
+    ``mode="soft_conf"`` (round-7, spec §2.4) confidence-weights the soft
+    consensus by ``gamma``; ``soft``/``hard`` ignore ``gamma`` and stay
+    byte-identical to the round-6 behaviour (default ``gamma=1.0`` → zero
+    regression for existing callers).
     """
     rows = _to_rows(matrix)
     if not rows:
@@ -75,6 +120,8 @@ def consensus_rank(
         return list(logprobs) if logprobs is not None else [0.0] * len(rows)
     if mode == "hard":
         return _hard_scores(rows, theta)
+    if mode == "soft_conf":
+        return _soft_conf_scores(rows, gamma, logprobs)
     return _soft_scores(rows)
 
 

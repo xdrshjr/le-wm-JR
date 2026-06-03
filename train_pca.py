@@ -120,18 +120,54 @@ def _build_train_projector(cfg) -> torch.nn.Module:
     return WorldModelProjector(pcfg)
 
 
+def _has_trainable_base(world_model) -> bool:
+    """True iff the encoder base has any trainable param (R7 unfreeze/LoRA)."""
+    enc = getattr(world_model, "encoder", None)
+    base = getattr(enc, "base", None) if enc is not None else None
+    if base is None:
+        return False
+    return any(p.requires_grad for p in base.parameters())
+
+
+def _stage0_optim(cfg, world_model) -> dict:
+    """spt optimizer spec for Stage-0 (spec §2.2 P1-1, corrected落点 D1).
+
+    Single group ``model_opt`` (legacy, byte-identical) unless the encoder
+    base is trainable (``unfreeze_top_n>0`` / LoRA) AND ``optimizer.lr_encoder``
+    is set: then two groups — a small-lr ``enc_opt`` over ``model.encoder.base``
+    (placed first so spt's first-match-wins routing assigns the base subtree
+    to it) + ``rest_opt`` over the rest — each with its own scheduler (spt
+    requires #schedulers == #optimizers, module.py:309-312).
+    """
+    sched = {"type": "LinearWarmupCosineAnnealingLR"}
+    opt_cfg = dict(cfg.optimizer)
+    lr_encoder = opt_cfg.pop("lr_encoder", None)
+    if lr_encoder is None or not _has_trainable_base(world_model):
+        return {
+            "model_opt": {
+                "modules": "model", "optimizer": opt_cfg,
+                "scheduler": dict(sched), "interval": "epoch",
+            },
+        }
+    enc_cfg = dict(opt_cfg)
+    enc_cfg["lr"] = lr_encoder
+    return {
+        "enc_opt": {
+            "modules": r"model\.encoder\.base", "optimizer": enc_cfg,
+            "scheduler": dict(sched), "interval": "epoch",
+        },
+        "rest_opt": {
+            "modules": "model", "optimizer": opt_cfg,
+            "scheduler": dict(sched), "interval": "epoch",
+        },
+    }
+
+
 def run_stage0(cfg) -> None:
     train, val = _build_loaders(cfg)
     world_model = hydra.utils.instantiate(cfg.model)
 
-    optimizers = {
-        "model_opt": {
-            "modules": "model",
-            "optimizer": dict(cfg.optimizer),
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
-            "interval": "epoch",
-        },
-    }
+    optimizers = _stage0_optim(cfg, world_model)
 
     data_module = spt.data.DataModule(train=train, val=val)
     module = spt.Module(

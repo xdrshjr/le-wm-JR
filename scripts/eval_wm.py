@@ -23,8 +23,10 @@ import hydra
 import torch
 from torch.utils.data import DataLoader
 
-# Allow ``python scripts/eval_wm.py`` from le-wm-JR root.
+# Allow ``python scripts/eval_wm.py`` from le-wm-JR root; the scripts dir is
+# also added so the shared ``diagnose_prediction.error_rates`` (D3) imports.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pca.data.collate import collate_trajectories  # noqa: E402
 from pca.data.dataset import (  # noqa: E402
@@ -377,6 +379,16 @@ def run(cfg):
         )
         payload["ece"] = _ece(sc, lab)
         payload["verifier_temp"] = temp
+        # R7 (spec §3 / D3): reuse the same flat (prob,label) aggregation as
+        # diagnose_prediction — Brier + false-pos/neg rates. Pure-additive; the
+        # candidate/test-side decomposition (needs the (K,T) structure) lives
+        # in diagnose_prediction.py. Best-effort: skip if import unavailable.
+        try:
+            from diagnose_prediction import error_rates
+
+            payload.update(error_rates(sc, lab))
+        except Exception:
+            pass
         auroc_msg = f" auroc={auroc} ece={payload['ece']}"
 
     # Stage-1 alignment quality — additive, only when align_ckpt+pairs set.

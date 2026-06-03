@@ -12,14 +12,19 @@
 defaults:
   - launcher: local
   - data: humaneval_wm
-  - model: wm_codebert_humaneval
+  # R7 (spec §2.2): strong code-native encoder (top-2 unfreeze) replaces the
+  # all-frozen R6 base. Override on the CLI with model=wm_codebert_humaneval
+  # for the all-frozen baseline ablation (spec §6 (a)).
+  - model: wm_code_strong_humaneval
   - _self_
 
 experiment:
   stage: stage0
   save_ckpt: true
 
-output_model_name: pca_wm_humaneval_v1
+# R7 (spec §3 / P2-2): bump v3 -> v4 so the R6 v3 checkpoint is never
+# clobbered by this round's strong-encoder run.
+output_model_name: pca_wm_humaneval_v4
 output_dir: runs/pca_humaneval
 subdir: ${hydra:job.id}
 
@@ -46,6 +51,12 @@ optimizer:
   type: AdamW
   lr: 1e-4             # R2: 3e-4→1e-4, 3e-4 destabilised the shared encoder
   weight_decay: 1e-3
+  # R7 (spec §2.2 P1-1): small lr for the unfrozen encoder top layers / LoRA.
+  # Consumed by train_pca._stage0_optim, which builds a separate enc_opt group
+  # over `model.encoder.base` at this lr. It is a plain scalar (NOT a change to
+  # the flat optimizer schema); when the base is fully frozen this is ignored
+  # and the legacy single optimizer group is used (zero regression).
+  lr_encoder: 2e-5
 
 wm:
   type: pca_text_wm_humaneval
@@ -75,7 +86,10 @@ data:
   # binary per-test label; ckpt selected by per-test val-AUROC (target
   # >=0.75). v2 (ratio-label) is still loadable for the verifier/fused
   # ablations by overriding data.path on the CLI.
-  path: data/trajectories/humaneval_wm_v3_pertest
+  # R7 (spec §2.3): v4 = per-test + AST hard-negatives + per-test class
+  # balance + larger scale (600×k8). The R6 v3_pertest set still loads for
+  # the all-frozen baseline by overriding data.path on the CLI.
+  path: data/trajectories/humaneval_wm_v4_pertest_hardneg
   max_obs_chars: 4000
   class_balance: true   # WeightedRandomSampler over pass/fail (Stage-0)
   select_by: val_auroc  # documented selection metric (select_best inline)

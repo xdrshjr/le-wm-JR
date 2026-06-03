@@ -25,11 +25,18 @@ _REPAIR_SYS = (
 )
 
 
-def _repair_user(problem: str, body: str) -> str:
+def _repair_user(problem: str, body: str, failing: list | None = None) -> str:
+    cases = ""
+    if failing:
+        joined = "\n".join(failing[:5])
+        cases = (
+            "\nThe world model predicts it FAILS these specific tests — fix "
+            f"them in particular:\n{joined}\n"
+        )
     return (
         "This function body is predicted to fail its tests. Return a "
         "corrected function body:\n\n"
-        f"```python\n{problem}{body}\n```\n"
+        f"```python\n{problem}{body}\n```\n{cases}"
     )
 
 
@@ -46,6 +53,12 @@ class RepairLoop:
         self.n_repair = n_repair
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        # PEC closed-loop knobs (spec §3 P1 / §2.4). Set as attributes (not
+        # ctor params) to keep the signature ≤5; callers may override before
+        # calling ``repair_and_rerank_pec``.
+        self.consensus_mode = "soft_conf"
+        self.gamma = 1.0
+        self.theta = 0.5
 
     def _verifier_prob(self, prompt: str, programs: list[str]) -> torch.Tensor:
         z1 = self.aligned.predict_outcome_latent(prompt, programs)
@@ -65,11 +78,13 @@ class RepairLoop:
         probs = mat[0].tolist()
         return [t for t, p in zip(tests, probs) if p < thr]
 
-    def _generate_repairs(self, problem: str, body: str) -> list[str]:
+    def _generate_repairs(
+        self, problem: str, body: str, failing: list | None = None,
+    ) -> list[str]:
         tok = self.aligned.tokenizer
         chat = tok.apply_chat_template(
             [{"role": "system", "content": _REPAIR_SYS},
-             {"role": "user", "content": _repair_user(problem, body)}],
+             {"role": "user", "content": _repair_user(problem, body, failing)}],
             tokenize=False, add_generation_prompt=True,
         )
         inputs = tok(chat, return_tensors="pt").to(self.aligned.llm.device)
@@ -115,5 +130,48 @@ class RepairLoop:
         new_scores = self.aligned.score_candidate(
             prompt, [c.program for c in merged], n_doctests,
             [c.text for c in merged],
+        )
+        return merged[self._argmax(new_scores)], new_scores
+
+    def _pec_scores(
+        self, prompt: str, programs: list[str], tests: list[str],
+    ) -> list[float]:
+        """Zero-exec CodeT consensus over the predicted (K,T) matrix."""
+        from pca.inference.consensus import consensus_rank
+
+        mat = self.aligned.predict_pass_matrix(prompt, programs, tests)
+        return consensus_rank(
+            mat.tolist(), [0.0] * len(programs), theta=self.theta,
+            mode=self.consensus_mode, gamma=self.gamma,
+        )
+
+    def repair_and_rerank_pec(
+        self, prompt: str, cands: list, assemble, tests: list[str],
+    ) -> tuple:
+        """PEC closed loop (spec §3 P1 / §6 fusion evidence; zero execution).
+
+        Rank by CodeT consensus over the predicted ``(K, T)`` matrix; if the
+        top candidate is predicted to fail some asserts, repair it **steered by
+        those concrete predicted-failing tests** (``predicted_failing_tests``),
+        resample, and re-rank the enlarged set by PEC. This closes the
+        predict→act→predict loop and routes the WM's per-test prediction into
+        the LLM's repair decision — the direct LLM↔WM coupling the round-3 red
+        line asks for. Falls back to log-prob argmax when there are no visible
+        tests. Nothing is executed.
+        """
+        programs = [c.program for c in cands]
+        if not tests:
+            return cands[self._argmax([c.logprob for c in cands])], []
+        scores = self._pec_scores(prompt, programs, tests)
+        best = self._argmax(scores)
+        failing = self.predicted_failing_tests(
+            prompt, cands[best].program, tests, thr=self.repair_threshold,
+        )
+        if not failing:
+            return cands[best], scores
+        repaired = self._generate_repairs(prompt, cands[best].text, failing)
+        merged = list(cands) + [assemble(prompt, r) for r in repaired]
+        new_scores = self._pec_scores(
+            prompt, [c.program for c in merged], tests,
         )
         return merged[self._argmax(new_scores)], new_scores

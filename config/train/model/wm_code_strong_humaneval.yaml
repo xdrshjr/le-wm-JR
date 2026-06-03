@@ -1,0 +1,85 @@
+# Round-7 STRONG code-native world-model config (spec §2.2 lever A-1).
+#
+# Identical to wm_codebert_humaneval.yaml EXCEPT the encoder no longer only
+# borrows a frozen sentence vector: the top-2 transformer layers of the
+# frozen Qwen2.5-0.5B base are UNFROZEN (+ final LayerNorm) so the world
+# model actually learns "execution semantics" — the direct answer to the
+# "fake world model" critique (spec §0 / §2.2 / K9). `freeze_base: true`
+# still freezes embeddings + the lower layers; only `unfreeze_top_n` top
+# layers get gradients (small lr 2e-5, set via optimizer.lr_encoder in the
+# Stage-0 yaml so the dual-optimizer split in train_pca.run_stage0 picks it
+# up). A light head dropout (0.1) curbs the extra overfitting capacity.
+#
+# Ablation matrix (spec §2.2): set on the CLI to compare —
+#   model.encoder.cfg.unfreeze_top_n=0          # all-frozen R6 baseline
+#   model.encoder.cfg.unfreeze_top_n=4          # deeper unfreeze
+#   model.encoder.cfg.use_lora=true \
+#     model.encoder.cfg.unfreeze_top_n=0        # LoRA(r=8) alternative
+# The all-frozen wm_codebert_humaneval.yaml is kept as the baseline config.
+_target_: pca.world_model.TextJEPA
+
+encoder:
+  _target_: pca.encoder.tool_io.ToolIOEncoder
+  cfg:
+    _target_: pca.encoder.tool_io.ToolIOEncoderConfig
+    base_model: Qwen/Qwen2.5-0.5B-Instruct
+    hidden_dim: ${wm.embed_dim}
+    out_dim: ${wm.embed_dim}
+    num_head_layers: 2
+    freeze_base: true
+    max_length: 512
+    pooling: mean
+    head_over_tokens: true
+    # Round-7 lever A (default档 = top-2 unfreeze). Mutually exclusive with
+    # use_lora; lr for these layers comes from optimizer.lr_encoder.
+    unfreeze_top_n: 2
+    use_lora: false
+    lora_rank: 8
+    lora_alpha: 16
+    encoder_dropout: 0.1
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${wm.history_size}
+  input_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  depth: 3
+  heads: 8
+  mlp_dim: 1024
+  dim_head: 48
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: pca.encoder.op_encoder.OpEncoder
+  cfg:
+    _target_: pca.encoder.op_encoder.OpEncoderConfig
+    num_op_types: 8
+    arg_max_tokens: 64
+    out_dim: ${wm.embed_dim}
+    hidden_dim: ${wm.embed_dim}
+    tokenizer_name: Qwen/Qwen2.5-1.5B-Instruct
+
+projector:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+outcome_head:
+  _target_: pca.outcome_head.OutcomeHead
+  in_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}

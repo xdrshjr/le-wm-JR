@@ -28,9 +28,10 @@ We therefore read the per-test trajectory ``test`` split directly via
 Usage:
     python le-wm-JR/scripts/calibrate_consensus.py \\
         --wm-ckpt <stage0 best> --wm-config wm_humaneval \\
-        --traj data/trajectories/humaneval_wm_v3_pertest \\
+        --traj data/trajectories/humaneval_wm_v4_pertest_hardneg \\
         --mbpp data/benchmarks/mbpp/mbpp.jsonl \\
-        --search-theta 0.4,0.5,0.6 --search-mode soft,hard
+        --search-theta 0.4,0.5,0.6 --search-mode soft,soft_conf,hard \\
+        --search-gamma 0.5,1.0,2.0
 """
 from __future__ import annotations
 
@@ -210,12 +211,18 @@ def _fit_temp(logit_mats: list, label_mats: list):
         _ece(logit_mats, label_mats, best_t)
 
 
-def _consensus_acc(logit_mats, tasks, temp, theta, mode) -> float:
+def _consensus_acc(logit_mats, tasks, temp, cfg) -> float:
+    """Dev rerank accuracy for one (theta, mode, gamma) point.
+
+    ``cfg`` = ``(theta, mode, gamma)``; gamma only affects ``soft_conf``
+    (spec §2.4), so soft/hard grids stay identical to round 6.
+    """
+    theta, mode, gamma = cfg
     correct = 0
     for mat, task in zip(logit_mats, tasks):
         probs = [[_sigmoid(x, temp) for x in row] for row in mat]
         scores = consensus_rank(
-            probs, [0.0] * len(probs), theta=theta, mode=mode
+            probs, [0.0] * len(probs), theta=theta, mode=mode, gamma=gamma
         )
         pred = max(range(len(scores)), key=lambda i: scores[i])
         correct += task["per_cand"][pred]
@@ -233,25 +240,32 @@ def _baseline_acc(logit_mats, tasks, temp) -> float:
 
 
 def _select(logit_mats, tasks, temp, args) -> dict:
-    """Grid-search theta × mode under the non-destructive guardrail."""
+    """Grid-search theta × mode × gamma under the non-destructive guardrail.
+
+    Gamma is only swept for ``soft_conf`` (it is a no-op elsewhere); other
+    modes are pinned to gamma=1.0 so the grid does not duplicate them.
+    """
+    gammas = _floats(args.search_gamma)
     grid = {}
     for mode in _modes(args.search_mode):
+        mode_gammas = gammas if mode == "soft_conf" else [1.0]
         for theta in _floats(args.search_theta):
-            grid[(mode, theta)] = _consensus_acc(
-                logit_mats, tasks, temp, theta, mode
-            )
+            for gamma in mode_gammas:
+                grid[(mode, theta, gamma)] = _consensus_acc(
+                    logit_mats, tasks, temp, (theta, mode, gamma)
+                )
     best = max(grid, key=lambda k: grid[k])
     base = _baseline_acc(logit_mats, tasks, temp)
     if grid[best] > base + 1e-9:
-        mode, theta, guard = best[0], best[1], False
+        mode, theta, gamma, guard = best[0], best[1], best[2], False
     else:
-        mode, theta, guard = "soft", 0.5, True
+        mode, theta, gamma, guard = "soft", 0.5, 1.0, True
     return {
-        "consensus_mode": mode, "theta": theta, "w_l": 0.0,
+        "consensus_mode": mode, "theta": theta, "gamma": gamma, "w_l": 0.0,
         "dev": {"acc": round(grid[best], 4), "baseline_argmax": round(base, 4),
                 "guardrail": guard, "n_dev": len(tasks),
-                "grid": {f"{m}_{th}": round(v, 4)
-                         for (m, th), v in grid.items()}},
+                "grid": {f"{m}_{th}_g{g}": round(v, 4)
+                         for (m, th, g), v in grid.items()}},
     }
 
 
@@ -282,6 +296,7 @@ def run(args) -> int:
     chosen = _select(logit_mats, tasks, temp, args)
     print(f"[calib_consensus] T={temp:.3f} ECE {ece_b:.4f}->{ece_a:.4f} "
           f"mode={chosen['consensus_mode']} theta={chosen['theta']} "
+          f"gamma={chosen['gamma']} "
           f"acc={chosen['dev']['acc']} base={chosen['dev']['baseline_argmax']} "
           f"guardrail={chosen['dev']['guardrail']} n_dev={len(tasks)}")
 
@@ -291,6 +306,7 @@ def run(args) -> int:
         "verifier_temp": temp,
         "theta": chosen["theta"],
         "consensus_mode": chosen["consensus_mode"],
+        "gamma": chosen["gamma"],
         "w_l": chosen["w_l"],
         "dev": chosen["dev"],
         "ece": {"before": round(ece_b, 4), "after": round(ece_a, 4)},
@@ -310,7 +326,10 @@ def main() -> int:
                     help="per-test trajectory dir (reads its test.jsonl)")
     ap.add_argument("--mbpp", default="data/benchmarks/mbpp/mbpp.jsonl")
     ap.add_argument("--search-theta", default="0.4,0.5,0.6")
-    ap.add_argument("--search-mode", default="soft,hard")
+    ap.add_argument("--search-mode", default="soft,soft_conf,hard",
+                    help="CodeT modes to grid (R7 adds soft_conf; spec §2.4)")
+    ap.add_argument("--search-gamma", default="0.5,1.0,2.0",
+                    help="confidence exponent grid for soft_conf (spec §2.4)")
     ap.add_argument("--search-wl", default="0.0",
                     help="reserved; w_l fusion needs the aligned model (P1)")
     ap.add_argument("--out", default=None,

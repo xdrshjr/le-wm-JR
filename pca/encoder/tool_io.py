@@ -38,6 +38,15 @@ class ToolIOEncoderConfig:
     # unchanged; the HumanEval verifier config opts into mean + token-head.
     pooling: str = "cls"            # "cls" | "mean"
     head_over_tokens: bool = False  # run head over full token sequence
+    # Round-7 (spec §2.2 lever A) — "true" code-native world model: let the
+    # top of the frozen base actually learn execution semantics instead of
+    # only borrowing a generic sentence vector. All default to OFF, so every
+    # pre-R7 config (MVP / goal_dist / R6 verifier) is byte-for-byte unchanged.
+    unfreeze_top_n: int = 0      # unfreeze the base's top-n transformer layers
+    use_lora: bool = False       # inject LoRA on the base (mutually exclusive)
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    encoder_dropout: float = 0.0  # dropout after the head (anti-overfit)
 
 
 class ToolIOEncoder(nn.Module):
@@ -54,10 +63,20 @@ class ToolIOEncoder(nn.Module):
         self.base = AutoModel.from_pretrained(cfg.base_model)
         base_hidden = self.base.config.hidden_size
 
+        if cfg.unfreeze_top_n > 0 and cfg.use_lora:
+            raise ValueError(
+                "unfreeze_top_n and use_lora are mutually exclusive "
+                "(spec §2.2): set exactly one of them."
+            )
         if cfg.freeze_base:
             for p in self.base.parameters():
                 p.requires_grad_(False)
             self.base.eval()
+        # Round-7 lever A: controlled unfreeze / LoRA on top of the freeze.
+        if cfg.unfreeze_top_n > 0:
+            self._apply_unfreeze(cfg.unfreeze_top_n)
+        elif cfg.use_lora:
+            self._apply_lora(cfg)
 
         self.input_proj = nn.Linear(base_hidden, cfg.hidden_dim)
         layer = nn.TransformerEncoderLayer(
@@ -68,7 +87,65 @@ class ToolIOEncoder(nn.Module):
             activation="gelu",
         )
         self.head = nn.TransformerEncoder(layer, num_layers=cfg.num_head_layers)
+        self.dropout = nn.Dropout(cfg.encoder_dropout)
         self.output_proj = nn.Linear(cfg.hidden_dim, cfg.out_dim)
+        # Any trainable base param ⇒ the base forward must build a graph.
+        self._base_trainable = any(
+            p.requires_grad for p in self.base.parameters()
+        )
+
+    def _base_layers(self):
+        """Locate the base transformer's layer list + final norm (R7 P1-2).
+
+        ``AutoModel.from_pretrained`` on Qwen2.5 returns a ``Qwen2Model``
+        whose decoder layers live at ``base.layers`` and final norm at
+        ``base.norm`` — NOT ``base.model.layers`` (that is the
+        ``Qwen2ForCausalLM`` path, absent here). Probe order: ``base.layers``
+        (Qwen2, first) → ``base.model.layers`` (version fallback) →
+        ``base.encoder.layer`` (codebert). Returns ``(layers, final_norm)``
+        with ``final_norm=None`` when the branch has no obvious末层 LN.
+        """
+        base = self.base
+        if hasattr(base, "layers"):
+            return base.layers, getattr(base, "norm", None)
+        inner = getattr(base, "model", None)
+        if inner is not None and hasattr(inner, "layers"):
+            return inner.layers, getattr(inner, "norm", None)
+        enc = getattr(base, "encoder", None)
+        if enc is not None and hasattr(enc, "layer"):
+            return enc.layer, None
+        return None, None
+
+    def _apply_unfreeze(self, n: int) -> None:
+        """Unfreeze the top-n base layers (+ final LN) so they can learn."""
+        layers, final_norm = self._base_layers()
+        if layers is None:
+            raise RuntimeError(
+                "unfreeze_top_n>0 but no transformer layer list found "
+                "(tried base.layers / base.model.layers / base.encoder.layer)"
+            )
+        for layer in list(layers)[-min(n, len(layers)):]:
+            for p in layer.parameters():
+                p.requires_grad_(True)
+            layer.train()
+        if final_norm is not None:
+            for p in final_norm.parameters():
+                p.requires_grad_(True)
+            final_norm.train()
+
+    def _apply_lora(self, cfg) -> None:
+        """Inject LoRA adapters on the base (low-overfit alt to unfreeze)."""
+        from peft import LoraConfig, get_peft_model
+
+        from pca.training.llava_stages import _LORA_TARGETS
+
+        lora_cfg = LoraConfig(
+            r=cfg.lora_rank, lora_alpha=cfg.lora_alpha,
+            target_modules=list(_LORA_TARGETS), lora_dropout=0.0,
+            bias="none",
+        )
+        self.base = get_peft_model(self.base, lora_cfg)
+        self.base.enable_input_require_grads()
 
     def _tokenize(self, texts: list[str]) -> dict[str, torch.Tensor]:
         device = next(self.parameters()).device
@@ -82,10 +159,11 @@ class ToolIOEncoder(nn.Module):
         return {k: v.to(device) for k, v in enc.items()}
 
     def _base_hidden(self, enc: dict) -> torch.Tensor:
-        if self.cfg.freeze_base:
-            with torch.no_grad():
-                out = self.base(**enc)
-        else:
+        # When the base is fully frozen, ``_base_trainable`` is False and
+        # ``set_grad_enabled(False)`` is exactly the old ``no_grad`` path
+        # (zero regression). With R7 top-n unfreeze / LoRA, gradients must
+        # flow through the base, so the graph is built (spec §2.2 P1-1).
+        with torch.set_grad_enabled(self._base_trainable):
             out = self.base(**enc)
         return out.last_hidden_state  # (B, L, base_hidden)
 
@@ -116,16 +194,21 @@ class ToolIOEncoder(nn.Module):
             x = self.input_proj(base_vec).unsqueeze(1)  # (B, 1, hidden)
             x = self.head(x)
             pooled = x[:, 0]
-        return self.output_proj(pooled)  # (B, out_dim)
+        return self.output_proj(self.dropout(pooled))  # (B, out_dim)
 
     def state_dict(self, *args, **kwargs):
-        """Drop the frozen base LM from checkpoints (Round-3 fix).
+        """Drop the *frozen* base LM weights from checkpoints (R3 + R7).
 
         The base is reloaded from HF at construction, so persisting its
-        weights every epoch is pure waste — a Qwen-0.5B base adds ~2 GB
-        per checkpoint and filled the disk. Trainable head / proj weights
-        are still saved; ``load_state_dict(..., strict=False)`` then leaves
-        the base at its pretrained init (correct, since it is frozen).
+        frozen weights every epoch is pure waste — a Qwen-0.5B base adds
+        ~2 GB per checkpoint and filled the disk. R7 refinement (spec §2.2):
+        only ``requires_grad=False`` base params (and all base buffers, which
+        HF reconstructs) are dropped — the unfrozen top-n layers / LoRA
+        adapters are KEPT so the learned execution semantics survive the
+        checkpoint. ``load_state_dict(..., strict=False)`` then leaves the
+        still-frozen base at its pretrained init (correct) and restores the
+        trainable layers/adapters. Trainable layers add only tens of MB
+        (<400 MB total ckpt; spec §5 / dev-log records the size).
         """
         sd = super().state_dict(*args, **kwargs)
         if not self.cfg.freeze_base:
@@ -133,10 +216,26 @@ class ToolIOEncoder(nn.Module):
         prefix = kwargs.get("prefix", "")
         if not prefix and len(args) >= 2 and isinstance(args[1], str):
             prefix = args[1]
-        drop = f"{prefix}base."
-        for k in [k for k in sd if k.startswith(drop)]:
+        drop = self._frozen_base_keys(prefix)
+        for k in [k for k in sd if k in drop]:
             del sd[k]
         return sd
+
+    def _frozen_base_keys(self, prefix: str) -> set:
+        """state_dict keys to drop: frozen base params + all base buffers."""
+        root = f"{prefix}base."
+        keep = {
+            f"{root}{name}"
+            for name, p in self.base.named_parameters()
+            if p.requires_grad
+        }
+        all_base = {
+            f"{root}{name}" for name, _ in self.base.named_parameters()
+        }
+        all_base |= {
+            f"{root}{name}" for name, _ in self.base.named_buffers()
+        }
+        return all_base - keep
 
     @property
     def _device(self) -> torch.device:
