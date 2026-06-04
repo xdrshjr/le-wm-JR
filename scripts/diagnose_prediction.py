@@ -158,7 +158,91 @@ def _pred_mats(reranker, tasks: list) -> list:
     return mats
 
 
+def _output_pred_cos(model, path: Path, device, bs: int = 64) -> float:
+    """Mean cos(ô, z_true) over a split — pure output-prediction fidelity (R8).
+
+    Separates *output prediction* error (does the WM predict the candidate's
+    actual output) from *pass derivation* error (does the predicted output
+    match the expected one); spec §3 diagnose extension.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from eval_wm import _exec_o_hat, _exec_z_out
+
+    rows = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            steps = (json.loads(line).get("steps") or [])
+            if steps and steps[0].get("out_repr") is not None:
+                rows.append(steps[0])
+    if not rows:
+        return 0.0
+    from pca.inference.wm_reranker import serialize_output
+
+    total, n = 0.0, 0
+    for i in range(0, len(rows), bs):
+        chunk = rows[i:i + bs]
+        o = _exec_o_hat(model, [s["obs_text"] for s in chunk], device)
+        zt = _exec_z_out(
+            model, [serialize_output(s["out_repr"]) for s in chunk], device
+        )
+        cos = (F.normalize(o, dim=-1) * F.normalize(zt, dim=-1)).sum(-1)
+        total += float(cos.sum().item())
+        n += cos.numel()
+    return round(total / max(n, 1), 4)
+
+
+def _run_exec(args) -> int:
+    """R8 exec attribution: output-pred vs pass error + transfer gap."""
+    import torch
+
+    from eval_wm import _exec_match_scores, _read_traj_steps
+    from pca.inference.wm_reranker import WMReranker, WMRerankerConfig
+
+    cfg = WMRerankerConfig(
+        wm_config_name=args.wm_config, ckpt_path=args.wm_ckpt,
+        score_mode="exec",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    rr = WMReranker(cfg)
+    base = Path(args.traj)
+    res: dict = {"leak_check": "dev/MBPP/multi-src only; HumanEval never read"}
+    for split, key in (("val", "src"), ("transfer", "transfer")):
+        rows = _read_traj_steps(base / f"{split}.jsonl")
+        sc, lab = _exec_match_scores(rr.model, rows, rr.device, 1.0) if rows \
+            else ([], [])
+        res[f"{key}_auroc"] = _auroc(sc, lab)
+        res[f"n_{key}"] = len(rows)
+        if key == "transfer":
+            res["derived_pass"] = error_rates(sc, lab)
+            res["output_pred_cos"] = _output_pred_cos(
+                rr.model, base / "transfer.jsonl", rr.device
+            )
+    src, tr = res.get("src_auroc"), res.get("transfer_auroc")
+    if src is not None and tr is not None:
+        res["transfer_gap"] = round(src - tr, 4)
+        res["verdict"] = (
+            "transfer_gap small → world model learned execution semantics"
+            if res["transfer_gap"] < 0.1
+            else "transfer_gap large → still source-overfit (cf. R7)"
+        )
+    res["output_match_auroc"] = res.get("transfer_auroc")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(res, indent=2), encoding="utf-8")
+    print(f"[diagnose] EXEC src_auroc={res.get('src_auroc')} "
+          f"transfer_auroc={res.get('transfer_auroc')} "
+          f"gap={res.get('transfer_gap')} "
+          f"output_pred_cos={res.get('output_pred_cos')} -> {out}")
+    return 0
+
+
 def run(args) -> int:
+    if getattr(args, "exec_mode", False) or "exec" in args.wm_config:
+        return _run_exec(args)
     from calibrate_consensus import (
         _build_reranker, _dev_tasks, _group_traj, _load_mbpp, _read_jsonl,
     )
@@ -193,6 +277,9 @@ def main() -> int:
                     help="per-test trajectory dir (reads its test.jsonl)")
     ap.add_argument("--mbpp", default="data/benchmarks/mbpp/mbpp.jsonl")
     ap.add_argument("--out", default="runs/diag/r7_attribution.json")
+    ap.add_argument("--exec", dest="exec_mode", action="store_true",
+                    help="R8 exec attribution (auto-on if wm-config has "
+                         "'exec'): output-pred vs pass error + transfer gap")
     return run(ap.parse_args())
 
 

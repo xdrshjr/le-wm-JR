@@ -1,0 +1,85 @@
+# Round-8 EXECUTION world-model config (spec wm-exec-trace-fusion-sota §3).
+#
+# Identical wiring to wm_codebert_humaneval.yaml (the all-frozen R6 baseline)
+# EXCEPT it adds an ``exec_head`` (pca.exec_head.ExecTraceHead) that predicts the
+# candidate's OUTPUT embedding instead of a pass bit. The encoder stays **fully
+# frozen** (freeze_base=true, unfreeze_top_n=0, use_lora=false) — R7 proved that
+# unfreezing overfits MBPP and *worsens* HumanEval transfer (report §10.3); the
+# round-8 lever is the execution-output objective + multi-source data, not a
+# stronger encoder (spec §2.2 invariant 5 / §0.2).
+#
+# ``outcome_head`` is kept so the binary-target baseline ablation (spec §6 (a))
+# can be run on the SAME v5 data + SAME frozen encoder by toggling loss flags.
+_target_: pca.world_model.TextJEPA
+
+encoder:
+  _target_: pca.encoder.tool_io.ToolIOEncoder
+  cfg:
+    _target_: pca.encoder.tool_io.ToolIOEncoderConfig
+    base_model: Qwen/Qwen2.5-0.5B-Instruct
+    hidden_dim: ${wm.embed_dim}
+    out_dim: ${wm.embed_dim}
+    num_head_layers: 2
+    freeze_base: true
+    max_length: 512
+    pooling: mean
+    head_over_tokens: true
+    # R8: revert R7's harmful unfreeze — encoder is fully frozen again.
+    unfreeze_top_n: 0
+    use_lora: false
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${wm.history_size}
+  input_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  depth: 3
+  heads: 8
+  mlp_dim: 1024
+  dim_head: 48
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: pca.encoder.op_encoder.OpEncoder
+  cfg:
+    _target_: pca.encoder.op_encoder.OpEncoderConfig
+    num_op_types: 8
+    arg_max_tokens: 64
+    out_dim: ${wm.embed_dim}
+    hidden_dim: ${wm.embed_dim}
+    tokenizer_name: Qwen/Qwen2.5-1.5B-Instruct
+
+projector:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${wm.embed_dim}
+  output_dim: ${wm.embed_dim}
+  hidden_dim: 1024
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+# Round-8 neural-executor head (spec §2.2): ẑ₁ → output embedding ô (proj_dim).
+exec_head:
+  _target_: pca.exec_head.ExecTraceHead
+  in_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}
+  proj_dim: 256
+  init_tau: 1.0
+
+# Kept for the binary-target ablation (spec §6 (a)); disabled by default via
+# loss.outcome.enabled=false in the Stage-0E top-level config.
+outcome_head:
+  _target_: pca.outcome_head.OutcomeHead
+  in_dim: ${wm.embed_dim}
+  hidden_dim: ${wm.embed_dim}

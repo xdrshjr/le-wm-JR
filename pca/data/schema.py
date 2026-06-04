@@ -26,6 +26,14 @@ class Step(BaseModel):
     # (verifier BCE target; spec §5.1). ``None`` for legacy / unlabeled
     # trajectories — keeps the MVP/synthetic schema backward compatible.
     label: float | None = None
+    # Round-8 execution-trace fields (spec wm-exec-trace-fusion-sota §5).
+    # ``out_repr`` = ``repr()`` of the candidate's REAL output on the test
+    # input (the obs_next_text payload); ``expected`` = the test's expected
+    # value (``None`` on the consistency / no_doctest path). Both default to
+    # ``None`` so every pre-R8 trajectory (MVP / v3 / v4) parses unchanged;
+    # the discriminability probe and per-source ablation read them off-line.
+    out_repr: str | None = None
+    expected: str | None = None
 
 
 class Trajectory(BaseModel):

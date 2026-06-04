@@ -69,14 +69,41 @@ class RepairLoop:
     ) -> list[str]:
         """Tests the world model PREDICTS ``program`` fails (zero exec; spec
         §3 P1 stretch). Reuses the PEC matrix
-        (``AlignedWMLLM.predict_pass_matrix``) so repair can be steered by the
-        concrete predicted-failing cases rather than a single global scalar.
+        (``AlignedWMLLM.predict_pass_matrix`` — execution-derived when the
+        aligned model is in exec_mode, spec §2.4.3) so repair can be steered by
+        the concrete predicted-failing cases rather than a single global scalar.
         """
         if not tests:
             return []
         mat = self.aligned.predict_pass_matrix(prompt, [program], tests)
+        if mat.numel() == 0:
+            return []
         probs = mat[0].tolist()
         return [t for t, p in zip(tests, probs) if p < thr]
+
+    def _failing_io_hints(self, failing: list[str]) -> list[str]:
+        """Frame predicted-failing asserts as (input → expected) repair hints.
+
+        R8 (spec §2.4.3): the execution world model predicts the candidate's
+        output on each input; for the inputs where that predicted output ≠ the
+        expected value, surface ``input → expected`` so the LLM repairs the
+        exact computation the WM imagines wrong (predict-act-predict).
+        """
+        from pca.inference.consensus import parse_assert_io
+
+        hints: list[str] = []
+        for t in failing:
+            call, expected = parse_assert_io(t)
+            if call is None:
+                hints.append(t)
+            elif expected is not None:
+                hints.append(
+                    f"{call} should return {expected} "
+                    "(world model predicts your output differs)"
+                )
+            else:
+                hints.append(f"{call} (world model predicts a wrong output)")
+        return hints
 
     def _generate_repairs(
         self, problem: str, body: str, failing: list | None = None,
@@ -169,7 +196,8 @@ class RepairLoop:
         )
         if not failing:
             return cands[best], scores
-        repaired = self._generate_repairs(prompt, cands[best].text, failing)
+        hints = self._failing_io_hints(failing)
+        repaired = self._generate_repairs(prompt, cands[best].text, hints)
         merged = list(cands) + [assemble(prompt, r) for r in repaired]
         new_scores = self._pec_scores(
             prompt, [c.program for c in merged], tests,

@@ -154,6 +154,12 @@ class AlignedWMLLM(nn.Module):
         self.soft_jitter = 0.1      # path-A per-candidate soft jitter (P1-D)
         self.test_proposer = None
         self.max_obs_chars = 4000
+        # R8 exec PEC (spec §2.4.1): when an exec_head is present and the
+        # align_config carries an ``exec`` block, predict_pass_matrix derives
+        # the matrix from predicted outputs instead of the verifier head.
+        self.exec_mode = False
+        self.exec_tau = 1.0
+        self.exec_cluster_thr = 0.7
 
         self.d_wm = 384
         self.wm = self._build_wm(wm_cfg_name)
@@ -296,6 +302,15 @@ class AlignedWMLLM(nn.Module):
         self.theta = float(meta.get("theta", self.theta))
         self.consensus_mode = meta.get("consensus_mode", self.consensus_mode)
         self.w_l = float(meta.get("w_l", self.w_l))
+        # R8 exec block (spec §2.4.1 C-8): turns predict_pass_matrix to the
+        # execution-output derivation; absent → verifier path (zero regression).
+        exec_meta = meta.get("exec") or {}
+        if exec_meta and getattr(self.wm, "exec_head", None) is not None:
+            self.exec_mode = True
+            self.exec_tau = float(exec_meta.get("tau", self.exec_tau))
+            self.exec_cluster_thr = float(
+                exec_meta.get("cluster_thr", self.exec_cluster_thr)
+            )
 
     def _load_lora(self, d: Path) -> None:
         lora = d / "lora" if d.is_dir() else None
@@ -510,18 +525,68 @@ class AlignedWMLLM(nn.Module):
         """(K, T) predicted P(candidate passes test) for PEC reuse (spec §3
         P1). Mirrors ``WMReranker.score_matrix`` via the shared
         ``serialize_test`` observation; executes nothing. Lets the consensus
-        path / repair loop reuse the aligned model's verifier head."""
+        path / repair loop reuse the aligned model's verifier head. When
+        ``exec_mode`` is on (align_config ``exec`` block + an exec_head), the
+        matrix is derived from predicted OUTPUTS via the single
+        ``consensus.exec_pass_from_outputs`` (spec §2.4.1 C-8)."""
         from pca.inference.wm_reranker import serialize_test
 
         k, t = len(programs), len(tests)
         if k == 0 or t == 0:
             return torch.zeros((k, t))
+        if self.exec_mode and getattr(self.wm, "exec_head", None) is not None:
+            return self._predict_pass_matrix_exec(prompt, programs, tests)
         texts = [
             serialize_test(prompt, p, tst)
             for p in programs for tst in tests
         ]
         z1 = self._encode_latent(texts)  # (K*T, d_wm)
         return self._verifier_scores(z1).view(k, t)
+
+    def _encode_obs_emb(self, texts: list[str]) -> torch.Tensor:
+        """Encoder embedding of obs texts (NO predict) → (N, d_wm); §2.2."""
+        cap = self.max_obs_chars
+        info = {
+            "obs_text": [[t[:cap]] for t in texts],
+            "op": [[_run_test_op()] for _ in texts],
+        }
+        with torch.no_grad(), _autocast(self.device):
+            info = self.wm.encode(info)
+            emb = info["emb"][:, 0]
+        return emb.float()
+
+    def _predict_pass_matrix_exec(
+        self, prompt: str, programs: list[str], tests: list[str]
+    ) -> torch.Tensor:
+        """Execution-output-derived (K, T) matrix (spec §2.4.1); zero exec."""
+        from pca.inference.consensus import (
+            exec_pass_from_outputs,
+            parse_assert_io,
+        )
+        from pca.inference.wm_reranker import serialize_exec, serialize_output
+
+        parsed = [parse_assert_io(tst) for tst in tests]
+        pairs = [(c, e) for c, e in parsed if c is not None]
+        if not pairs:
+            return torch.zeros((len(programs), 0))
+        calls = [c for c, _e in pairs]
+        expecteds = [e for _c, e in pairs]
+        has_exp = all(e is not None for e in expecteds)
+        head = self.wm.exec_head
+        k, t = len(programs), len(calls)
+        texts = [serialize_exec(prompt, p, c) for p in programs for c in calls]
+        o_hat = head.predict_output(self._encode_latent(texts)).view(k, t, -1)
+        z_exp = None
+        if has_exp:
+            emb = self._encode_obs_emb(
+                [serialize_output(e or "") for e in expecteds]
+            )
+            z_exp = head.embed_output(emb).detach().cpu()
+        matrix = exec_pass_from_outputs(
+            o_hat.detach().cpu(), z_exp,
+            tau=self.exec_tau, cluster_thr=self.exec_cluster_thr,
+        )
+        return torch.tensor(matrix)
 
     def _cond_logprob(
         self, prompt: str, completion: str, soft: torch.Tensor

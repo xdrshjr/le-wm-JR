@@ -120,6 +120,13 @@ class AlignStage1Module(pl.LightningModule):
         self.optimizer_cfg = dict(optimizer_cfg)
         self.tau = float(loss_cfg.get("tau", 0.07))
         self.lam = float(loss_cfg.get("lam", 1.0))
+        # R8 (spec §2.4.2): on v5 execution-trace data the alignment target
+        # row[1] is already the OUTPUT text, so this aligns the predicted
+        # execution representation to the LLM's view of the real output (a more
+        # LLaVA-faithful target than a pass/fail stub). Set ``align_signal``
+        # to "exec_output" to instead project the exec_head's predicted output
+        # ô (requires a projector with in_dim == exec_head.proj_dim).
+        self.align_signal = str(loss_cfg.get("align_signal", "z1"))
         self._text_model = None
         self._text_tok = None
 
@@ -157,6 +164,9 @@ class AlignStage1Module(pl.LightningModule):
             info = self.world_model.encode(batch)
             emb, act = info["emb"], info["act_emb"]
             z1 = self.world_model.predict(emb[:, :1], act[:, :1])[:, -1]
+            head = getattr(self.world_model, "exec_head", None)
+            if self.align_signal == "exec_output" and head is not None:
+                z1 = head.predict_output(z1)  # ô — exec representation (§2.4.2)
         return z1.detach().float()
 
     def training_step(self, batch, batch_idx):

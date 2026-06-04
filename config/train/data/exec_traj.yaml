@@ -1,0 +1,7 @@
+# Round-8 multi-source EXECUTION-TRACE trajectories (spec §3 / §5).
+# Path layout: <data.path>/{train,val,transfer,test}.jsonl (+ manifest.json),
+# produced by scripts/gen_exec_traj.py. ``transfer`` is the OOD selection split
+# (mbpp_plus + hardest-MBPP quartile); ``test`` mirrors ``transfer`` for the
+# calibrate/diagnose ``--traj`` consumers (spec §2.5).
+path: data/trajectories/exec_traj_v5_multisrc
+max_obs_chars: 4000

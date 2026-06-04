@@ -1,0 +1,90 @@
+# Stage-0E config for the round-8 EXECUTION world model (spec §3 / §2.5).
+#
+# Trains a TextJEPA (+ ExecTraceHead) on multi-source execution-trace
+# trajectories: single-step prediction (history_size=1, num_preds=1 → window=2),
+# so the predictor maps (problem+candidate, predict-output) → the output-text
+# latent, and ExecTraceHead aligns its predicted output embedding to that
+# latent (InfoNCE) + trains the output-equality match head (spec §2.2).
+#
+# Encoder fully frozen (R7's unfreeze hurt transfer; report §10.3). Selection is
+# by **transfer-AUROC** on the OOD ``transfer`` split — NOT MBPP-only val AUROC
+# (the R7 misleading proxy; spec §2.5 C-1). That selection runs in
+# manual-scripts/01-bench/01-train-wm.sh + runs/_upload/select_best.py +
+# scripts/eval_wm.py, instantiated with THIS config so exec_head loads.
+defaults:
+  - launcher: local
+  - data: exec_traj
+  - model: wm_exec_humaneval
+  - _self_
+
+experiment:
+  stage: stage0
+  save_ckpt: true
+
+# v5 so the R6 v3 / R7 v4 checkpoints are never clobbered (spec §2.5 / §5).
+output_model_name: pca_wm_humaneval_v5_exec
+output_dir: runs/pca_humaneval
+subdir: ${hydra:job.id}
+
+num_workers: 2
+seed: 0
+
+# Turing has no bf16 — keep fp16 (CLAUDE.md / R01). Encoder frozen → no
+# gradient_checkpointing needed.
+trainer:
+  max_epochs: 16
+  devices: 1
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 5
+
+loader:
+  batch_size: 32       # larger batch → richer in-batch negatives for InfoNCE
+  num_workers: ${num_workers}
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+optimizer:
+  type: AdamW
+  lr: 1e-4
+  weight_decay: 1e-3
+
+wm:
+  type: pca_text_wm_exec
+  history_size: 1
+  num_preds: 1
+  embed_dim: 384
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
+  # Round-8 ExecTraceHead loss (spec §2.2): β·InfoNCE(ô, z_true) +
+  # μ·output-equality BCE. The headline lever — keep enabled.
+  exec:
+    enabled: true
+    beta: 1.0
+    mu: 0.5
+  # Binary-target baseline (spec §6 (a) ablation). Disabled by default; flip
+  # to enabled=true (+ loss.exec.enabled=false) to compare the two objectives
+  # on the SAME v5 data + frozen encoder (controlled variable; C-11).
+  outcome:
+    enabled: false
+    weight: 0.5
+
+data:
+  path: data/trajectories/exec_traj_v5_multisrc
+  max_obs_chars: 4000
+  # ExecTraceHead uses in-batch negatives, not per-test class balancing.
+  class_balance: false
+  select_by: transfer_auroc
+
+wandb:
+  enabled: false
+  config:
+    project: pca-wm
+    mode: offline

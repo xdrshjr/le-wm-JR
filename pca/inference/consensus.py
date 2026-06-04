@@ -32,6 +32,8 @@ and reorders candidates — it never executes anything.
 """
 from __future__ import annotations
 
+import ast
+import math
 from collections import Counter
 
 
@@ -123,6 +125,116 @@ def consensus_rank(
     if mode == "soft_conf":
         return _soft_conf_scores(rows, gamma, logprobs)
     return _soft_scores(rows)
+
+
+# ----- round-8 execution-derived pass matrix (spec §2.4.1) -------------
+
+
+def parse_assert_io(assert_text: str) -> tuple[str | None, str | None]:
+    """Split an assert/doctest into ``(call_form, expected)`` (spec §2.4.1 C-3).
+
+    ``assert f(2, 3) == 5`` → ``("f(2, 3)", "5")``. When the assert is not an
+    ``==`` comparison (``assert is_prime(7)``) the call form is the whole test
+    expression and ``expected`` is ``None`` → the consistency path. Parse
+    failures return ``(None, None)`` so the caller can drop the test.
+    """
+    try:
+        tree = ast.parse(assert_text.strip())
+    except SyntaxError:
+        return None, None
+    if not tree.body or not isinstance(tree.body[0], ast.Assert):
+        return None, None
+    test = tree.body[0].test
+    if (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)):
+        return ast.unparse(test.left), ast.unparse(test.comparators[0])
+    return ast.unparse(test), None
+
+
+def _to_list3(x) -> list[list[list[float]]]:
+    """Coerce a (K, T, P) tensor / nested sequence to nested float lists."""
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [[[float(v) for v in cell] for cell in row] for row in x]
+
+
+def _to_list2(x) -> list[list[float]]:
+    """Coerce a (T, P) tensor / nested sequence to nested float lists."""
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [[float(v) for v in row] for row in x]
+
+
+def _cos(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two equal-length embedding vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def _expected_matrix(out3, exp2, tau: float) -> list[list[float]]:
+    """has_doctest path: P[c,t] = σ(cos(ô[c,t], z(e_t)) / τ) (spec §2.4.1)."""
+    k = len(out3)
+    t = len(out3[0]) if k else 0
+    return [
+        [_sigmoid(_cos(out3[c][j], exp2[j]) / tau) for j in range(t)]
+        for c in range(k)
+    ]
+
+
+def _consistency_matrix(
+    out3, tau: float, cluster_thr: float
+) -> list[list[float]]:
+    """no_doctest path: soft majority-cluster membership of ô[·,t] (MBR-EXEC).
+
+    For each test column, ``P[c,t]`` is the mean soft agreement of candidate
+    ``c``'s predicted output with every candidate's (incl. itself), so a
+    candidate whose output is shared by many others scores high — the
+    execution analogue of self-consistency, fed to the same ``consensus_rank``
+    (spec §2.4.1, no expected value needed).
+    """
+    k = len(out3)
+    t = len(out3[0]) if k else 0
+    matrix = [[0.0] * t for _ in range(k)]
+    for j in range(t):
+        outs = [out3[c][j] for c in range(k)]
+        for c in range(k):
+            agree = sum(
+                _sigmoid((_cos(outs[c], outs[d]) - cluster_thr) / tau)
+                for d in range(k)
+            )
+            matrix[c][j] = agree / max(k, 1)
+    return matrix
+
+
+def exec_pass_from_outputs(
+    out_embeds, expected_embeds=None, *,
+    tau: float = 1.0, cluster_thr: float = 0.7,
+) -> list[list[float]]:
+    """(K, T, P) predicted output embeddings → (K, T) pass/consistency matrix.
+
+    The single source of the round-8 PEC matrix (``score_matrix_exec`` /
+    ``AlignedWMLLM.predict_pass_matrix`` are thin wrappers; spec §2.4.1 C-8).
+    ``expected_embeds`` given (has_doctest, (T, P)) → compare predicted output
+    to the expected output; ``None`` (no_doctest) → candidate-vs-candidate
+    output consistency. The result feeds the *unchanged* ``consensus_rank``;
+    nothing is executed.
+    """
+    out3 = _to_list3(out_embeds)
+    if not out3 or not out3[0]:
+        return [[] for _ in out3]
+    tau = max(float(tau), 1e-3)
+    if expected_embeds is not None:
+        return _expected_matrix(out3, _to_list2(expected_embeds), tau)
+    return _consistency_matrix(out3, tau, cluster_thr)
 
 
 def _extract_doctests(prompt: str, entry_point: str) -> list[str]:

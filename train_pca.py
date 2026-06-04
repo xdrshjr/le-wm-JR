@@ -3,7 +3,10 @@
 Bypasses ``swm.data.load_dataset`` by consuming ``TrajectoryDataset``
 directly. Dispatches on ``cfg.experiment.stage``:
 
-    stage0  world model only (TextJEPA + OutcomeHead)        — unchanged
+    stage0  world model only (TextJEPA + OutcomeHead / R8 ExecTraceHead)
+            — the R8 exec loss branch lives in ``pca.forward`` and is gated by
+            ``loss.exec.enabled``; with the encoder fully frozen
+            ``_stage0_optim`` keeps its single-group path (zero change here)
     stage1  LLaVA feature alignment (projector only)         — real loss
     stage2  predict-conditioned instruction tuning           — projector
             + Qwen-LoRA + OutcomeHead

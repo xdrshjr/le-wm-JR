@@ -180,6 +180,108 @@ def _eval_outcome_auroc(model, loader, ctx_len: int, n_preds: int, device):
     return _auroc(scores, labels)
 
 
+# ----- round-8 execution-output transfer metrics (spec §2.5 / §6, C-6) ----
+
+
+def _exec_enabled(cfg) -> bool:
+    loss_cfg = cfg.get("loss", None)
+    ex = loss_cfg.get("exec") if loss_cfg is not None else None
+    return bool(ex) and bool(ex.get("enabled", False))
+
+
+def _read_traj_steps(path: Path) -> list[tuple]:
+    """step0 ``(obs_text, expected, label)`` for samples with an expected."""
+    rows: list[tuple] = []
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        steps = (json.loads(line).get("steps") or [])
+        if not steps:
+            continue
+        s0 = steps[0]
+        exp, lab = s0.get("expected"), s0.get("label")
+        if exp is None or lab is None:
+            continue
+        rows.append((s0["obs_text"], exp, lab))
+    return rows
+
+
+def _exec_o_hat(model, texts: list[str], device, cap: int = 4000):
+    """ô = exec_head.predict_output(ẑ₁(obs)) for serialize_exec obs → (N, P)."""
+    from pca.action.schema import RunTestArgs
+
+    op = RunTestArgs(selector="visible_tests", timeout_sec=5)
+    info = {"obs_text": [[t[:cap]] for t in texts],
+            "op": [[op] for _ in texts]}
+    with torch.no_grad():
+        info = model.encode(info)
+        z1 = model.predict(info["emb"][:, :1], info["act_emb"][:, :1])[:, -1]
+        o = model.exec_head.predict_output(z1)
+    return o.float().to(device)
+
+
+def _exec_z_out(model, texts: list[str], device, cap: int = 4000):
+    """z_out = exec_head.embed_output(encode(serialize_output)) → (N, P)."""
+    from pca.action.schema import RunTestArgs
+
+    op = RunTestArgs(selector="visible_tests", timeout_sec=5)
+    info = {"obs_text": [[t[:cap]] for t in texts],
+            "op": [[op] for _ in texts]}
+    with torch.no_grad():
+        info = model.encode(info)
+        z = model.exec_head.embed_output(info["emb"][:, 0])
+    return z.float().to(device)
+
+
+def _exec_match_scores(model, rows, device, tau, bs: int = 64):
+    """σ(cos(ô, z(expected))/τ) vs binarized label, over (obs, expected)."""
+    import torch.nn.functional as F
+
+    from pca.inference.wm_reranker import serialize_output
+
+    scores: list[float] = []
+    labels: list[int] = []
+    tau = max(float(tau), 1e-3)
+    for i in range(0, len(rows), bs):
+        chunk = rows[i:i + bs]
+        o = _exec_o_hat(model, [r[0] for r in chunk], device)
+        z = _exec_z_out(
+            model, [serialize_output(r[1]) for r in chunk], device
+        )
+        cos = (F.normalize(o, dim=-1) * F.normalize(z, dim=-1)).sum(-1)
+        scores.extend(torch.sigmoid(cos / tau).cpu().tolist())
+        labels.extend(1 if float(r[2]) >= 0.5 else 0 for r in chunk)
+    return scores, labels
+
+
+def _eval_exec_transfer(model, cfg, device):
+    """src (val) vs transfer output-match AUROC + transfer_gap (spec §6, C-1).
+
+    The selection metric for round-8 Stage-0E: a SMALL ``transfer_gap`` and a
+    high ``transfer_auroc`` mean the world model learned execution semantics
+    that generalise, not MBPP table lookup (the R7 failure). Additive — returns
+    ``None`` unless ``loss.exec`` is on and an exec_head is present.
+    """
+    if not _exec_enabled(cfg) or getattr(model, "exec_head", None) is None:
+        return None
+    tau = float(cfg.get("exec_tau", 1.0))
+    base = Path(cfg.data.path)
+    res: dict = {}
+    for name, key in (("val", "src"), ("transfer", "transfer")):
+        rows = _read_traj_steps(base / f"{name}.jsonl")
+        au = _auroc(*_exec_match_scores(model, rows, device, tau)) if rows \
+            else None
+        res[f"{key}_auroc"] = au
+        res[f"n_{key}"] = len(rows)
+    src_au, tr_au = res.get("src_auroc"), res.get("transfer_auroc")
+    if src_au is not None and tr_au is not None:
+        res["transfer_gap"] = round(src_au - tr_au, 4)
+    res["output_match_auroc"] = res.get("transfer_auroc")
+    return res
+
+
 def _ece(scores: list[float], labels: list[int], n_bins: int = 10):
     """Expected Calibration Error (reliability); ``None`` if empty (P1)."""
     import numpy as np
@@ -391,6 +493,18 @@ def run(cfg):
             pass
         auroc_msg = f" auroc={auroc} ece={payload['ece']}"
 
+    # Round-8 execution-output transfer metrics (spec §2.5 / §6) — additive,
+    # only when loss.exec is on + an exec_head is present. This is the
+    # transfer-AUROC the Stage-0E selector picks on (C-1/C-6).
+    exec_t = _eval_exec_transfer(model, cfg, device)
+    exec_msg = ""
+    if exec_t is not None:
+        payload["exec_transfer"] = exec_t
+        exec_msg = (
+            f" transfer_auroc={exec_t.get('transfer_auroc')}"
+            f" gap={exec_t.get('transfer_gap')}"
+        )
+
     # Stage-1 alignment quality — additive, only when align_ckpt+pairs set.
     align = _eval_alignment_quality(cfg, model, device)
     align_msg = ""
@@ -403,7 +517,8 @@ def run(cfg):
         f"[eval_wm] split={split} tag={tag} "
         f"pred_loss_mean={pred_loss:.6f} "
         f"norm_mse={scale_inv['norm_mse']:.4f} "
-        f"cosine={scale_inv['cosine']:.4f}{auroc_msg}{align_msg} -> {out}"
+        f"cosine={scale_inv['cosine']:.4f}{auroc_msg}{exec_msg}{align_msg} "
+        f"-> {out}"
     )
 
 

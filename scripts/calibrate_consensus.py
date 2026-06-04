@@ -281,7 +281,190 @@ def _build_reranker(args) -> WMReranker:
     return WMReranker(cfg)
 
 
+# ----- round-8 exec-mode calibration (spec §2.4.1 / §2.6) --------------
+
+
+def _is_exec(args) -> bool:
+    return bool(getattr(args, "exec_mode", False)) or "exec" in args.wm_config
+
+
+def _parse_exec_obs(obs: str) -> tuple[str, str, str]:
+    """serialize_exec obs → ``(problem, input, program)`` (best-effort)."""
+    problem = inp = prog = ""
+    if "\nINPUT:\n" in obs:
+        problem = obs.split("PROBLEM:\n", 1)[-1].split("\nINPUT:\n", 1)[0]
+        rest = obs.split("\nINPUT:\n", 1)[1]
+        inp = rest.split("\nCANDIDATE:\n", 1)[0]
+    if "\nCANDIDATE:\n" in obs:
+        prog = obs.split("\nCANDIDATE:\n", 1)[1].rsplit("\nACTION:", 1)[0]
+    return problem, inp, prog
+
+
+def _group_exec(rows: list[dict]) -> dict:
+    """{key: {cand: {program, stub, inputs[], expected[], labels[]}}}."""
+    groups: dict = {}
+    for tr in rows:
+        iid = tr.get("instance_id", "")
+        steps = tr.get("steps") or []
+        if "-cand" not in iid or not steps:
+            continue
+        s0 = steps[0]
+        key, cseg = iid.rsplit("-cand", 1)
+        try:
+            cand = int(cseg.split("-")[0])
+        except ValueError:
+            continue
+        problem, inp, prog = _parse_exec_obs(s0.get("obs_text", ""))
+        g = groups.setdefault(key, {}).setdefault(
+            cand, {"program": prog, "stub": problem,
+                   "inputs": [], "expected": [], "labels": []}
+        )
+        g["inputs"].append(inp)
+        g["expected"].append(s0.get("expected"))
+        g["labels"].append(s0.get("label"))
+    return groups
+
+
+def _exec_dev_tasks(groups: dict) -> list[dict]:
+    """Per problem: candidate programs + shared inputs/expected + labels."""
+    tasks: list[dict] = []
+    for cands in groups.values():
+        ref = max(cands.values(), key=lambda g: len(g["inputs"]))
+        programs, per_cand = [], []
+        for _c, g in sorted(cands.items()):
+            if not g["program"]:
+                continue
+            labels = [v for v in g["labels"] if v is not None]
+            programs.append(g["program"])
+            per_cand.append(1 if labels and all(v >= 0.5 for v in labels)
+                            else 0)
+        if len(programs) < 2:
+            continue
+        tasks.append({
+            "stub": ref["stub"], "programs": programs,
+            "inputs": ref["inputs"], "expected": ref["expected"],
+            "per_cand": per_cand,
+        })
+    return tasks
+
+
+def _exec_cache(reranker, tasks: list[dict]) -> list:
+    """Cache (ô, z_exp) per task — one WM pass each (spec §2.4.1)."""
+    cache = []
+    for task in tasks:
+        has_exp = all(e is not None for e in task["expected"])
+        o_hat, z_exp = reranker.exec_embeddings(
+            task["stub"], task["programs"], task["inputs"],
+            task["expected"] if has_exp else None,
+        )
+        cache.append((o_hat, z_exp))
+    return cache
+
+
+def _exec_acc(cache, tasks, tau, cluster_thr, cfg_mgt) -> float:
+    """Dev rerank acc for one (τ, cluster_thr, mode, gamma, theta)."""
+    from pca.inference.consensus import (
+        consensus_rank,
+        exec_pass_from_outputs,
+    )
+
+    mode, gamma, theta = cfg_mgt
+    correct = 0
+    for (o_hat, z_exp), task in zip(cache, tasks):
+        mat = exec_pass_from_outputs(
+            o_hat, z_exp, tau=tau, cluster_thr=cluster_thr
+        )
+        scores = consensus_rank(mat, [0.0] * len(mat), theta=theta,
+                                mode=mode, gamma=gamma)
+        pred = max(range(len(scores)), key=lambda i: scores[i])
+        correct += task["per_cand"][pred]
+    return correct / max(len(tasks), 1)
+
+
+def _select_exec(cache, tasks, args) -> dict:
+    """Grid τ × cluster_thr × mode × gamma × theta, guardrailed (spec §2.6)."""
+    best, best_acc = None, -1.0
+    for mode in _modes(args.search_mode):
+        gammas = _floats(args.search_gamma) if mode == "soft_conf" else [1.0]
+        for theta in _floats(args.search_theta):
+            for gamma in gammas:
+                for tau in _floats(args.search_tau):
+                    for cthr in _floats(args.search_cluster_thr):
+                        acc = _exec_acc(cache, tasks, tau, cthr,
+                                        (mode, gamma, theta))
+                        if acc > best_acc:
+                            best_acc, best = acc, (mode, theta, gamma,
+                                                   tau, cthr)
+    base = _exec_baseline(cache, tasks)
+    guard = best_acc <= base + 1e-9
+    if guard:
+        best = ("soft", 0.5, 1.0, 1.0, 0.7)
+    mode, theta, gamma, tau, cthr = best
+    return {
+        "consensus_mode": mode, "theta": theta, "gamma": gamma, "w_l": 0.0,
+        "exec": {"tau": tau, "cluster_thr": cthr,
+                 "use_agreement_for_no_doctest": True},
+        "dev": {"acc": round(best_acc, 4), "baseline": round(base, 4),
+                "guardrail": guard, "n_dev": len(tasks)},
+    }
+
+
+def _exec_baseline(cache, tasks) -> float:
+    """Mean predicted output-match argmax (no consensus): the guardrail base."""
+    from pca.inference.consensus import exec_pass_from_outputs
+
+    correct = 0
+    for (o_hat, z_exp), task in zip(cache, tasks):
+        mat = exec_pass_from_outputs(o_hat, z_exp, tau=1.0, cluster_thr=0.7)
+        means = [sum(r) / max(len(r), 1) for r in mat]
+        pred = max(range(len(means)), key=lambda i: means[i])
+        correct += task["per_cand"][pred]
+    return correct / max(len(tasks), 1)
+
+
+def _run_exec(args) -> int:
+    import torch
+
+    rows = _read_jsonl(Path(args.traj) / "test.jsonl")
+    tasks = _exec_dev_tasks(_group_exec(rows))
+    if not tasks:
+        raise SystemExit(
+            f"[calib_consensus] no exec dev tasks from {args.traj}/test.jsonl"
+        )
+    cfg = WMRerankerConfig(
+        wm_config_name=args.wm_config, ckpt_path=args.wm_ckpt,
+        score_mode="exec",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    reranker = WMReranker(cfg)
+    chosen = _select_exec(_exec_cache(reranker, tasks), tasks, args)
+    print(f"[calib_consensus] EXEC mode={chosen['consensus_mode']} "
+          f"theta={chosen['theta']} gamma={chosen['gamma']} "
+          f"tau={chosen['exec']['tau']} cthr={chosen['exec']['cluster_thr']} "
+          f"acc={chosen['dev']['acc']} base={chosen['dev']['baseline']} "
+          f"guardrail={chosen['dev']['guardrail']} n_dev={len(tasks)}")
+    out_dir = Path(args.out) if args.out \
+        else Path(args.wm_ckpt).resolve().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "verifier_temp": 1.0,
+        "theta": chosen["theta"],
+        "consensus_mode": chosen["consensus_mode"],
+        "gamma": chosen["gamma"],
+        "w_l": chosen["w_l"],
+        "exec": chosen["exec"],
+        "dev": chosen["dev"],
+        "leak_check": "dev/MBPP/multi-src only; HumanEval never read",
+    }
+    out_path = out_dir / "consensus_config.json"
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[calib_consensus] wrote {out_path}")
+    return 0
+
+
 def run(args) -> int:
+    if _is_exec(args):
+        return _run_exec(args)
     mbpp = _load_mbpp(args.mbpp)
     rows = _read_jsonl(Path(args.traj) / "test.jsonl")
     tasks = _dev_tasks(_group_traj(rows), mbpp)
@@ -332,6 +515,14 @@ def main() -> int:
                     help="confidence exponent grid for soft_conf (spec §2.4)")
     ap.add_argument("--search-wl", default="0.0",
                     help="reserved; w_l fusion needs the aligned model (P1)")
+    # R8 exec-mode grids (spec §2.4.1): output-similarity τ + cluster threshold.
+    ap.add_argument("--exec", dest="exec_mode", action="store_true",
+                    help="calibrate the exec PEC matrix (auto-on if wm-config "
+                         "name contains 'exec'); writes the exec block")
+    ap.add_argument("--search-tau", default="0.5,1.0,2.0",
+                    help="exec output-similarity temperature grid (§2.4.1)")
+    ap.add_argument("--search-cluster-thr", default="0.6,0.75",
+                    help="exec consistency cluster-threshold grid (§2.4.1)")
     ap.add_argument("--out", default=None,
                     help="output dir (default: alongside --wm-ckpt)")
     return run(ap.parse_args())

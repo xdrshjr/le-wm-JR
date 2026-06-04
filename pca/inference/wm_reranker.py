@@ -103,6 +103,33 @@ def serialize_test(prompt: str, program: str, test: str) -> str:
     )
 
 
+# R8 (spec wm-exec-trace-fusion-sota §2.2): execution-trace observation. The
+# world model predicts the candidate's OUTPUT on a test INPUT (not a pass bit),
+# so the field order is PROBLEM→INPUT→CANDIDATE→ACTION — the discriminative
+# INPUT segment stays before the (capped) candidate, truncation-safe like
+# ``serialize_test`` (R3). ``test_input`` is the call form only (e.g.
+# ``f(2,3)``) — NO expected value (that is the other input to the comparison;
+# spec §2.2). ``serialize_exec`` / ``serialize_output`` are the single source
+# of truth shared verbatim by ``gen_exec_traj`` (training) and
+# ``score_matrix_exec`` (inference).
+
+
+def serialize_exec(problem: str, candidate: str, test_input: str) -> str:
+    """Per-input observation: predict ``candidate`` output on ``test_input``."""
+    prog = candidate if len(candidate) <= _PROG_CAP else candidate[:_PROG_CAP]
+    return (
+        f"PROBLEM:\n{problem}\n"
+        f"INPUT:\n{test_input}\n"
+        f"CANDIDATE:\n{prog}\n"
+        f"ACTION: predict output"
+    )
+
+
+def serialize_output(output_repr: str) -> str:
+    """Post-execution output observation (``repr``-normalised value text)."""
+    return f"OUTPUT:\n{output_repr}"
+
+
 # Canonical single-test "passed" result string (per-test step1 obs_text).
 PASS_TEMPLATE = "RESULT: test passed; status=PASS; first_error: none"
 
@@ -125,10 +152,14 @@ class WMRerankerConfig:
 
     wm_config_name: str = "wm_humaneval"  # hydra config under config/train/
     ckpt_path: str | None = None
-    score_mode: str = "verifier"  # "verifier" | "goal_dist"
+    score_mode: str = "verifier"  # "verifier" | "goal_dist" | "exec"
     device: str = "cuda"
     max_obs_chars: int = 4000
     verifier_temp: float = 1.0  # sigmoid temperature for score_matrix (PEC)
+    # R8 exec mode (spec §2.4.1): output-similarity temperature + cluster
+    # threshold for the execution-derived consensus matrix.
+    exec_tau: float = 1.0
+    exec_cluster_thr: float = 0.7
 
 
 def _maybe_autocast(device: torch.device):
@@ -148,9 +179,10 @@ class WMReranker:
 
     def __init__(self, cfg: WMRerankerConfig) -> None:
         self.cfg = cfg
-        if cfg.score_mode not in ("verifier", "goal_dist"):
+        if cfg.score_mode not in ("verifier", "goal_dist", "exec"):
             raise ValueError(
-                f"score_mode must be verifier|goal_dist, got {cfg.score_mode!r}"
+                "score_mode must be verifier|goal_dist|exec, got "
+                f"{cfg.score_mode!r}"
             )
         self.device = torch.device(
             cfg.device if torch.cuda.is_available() else "cpu"
@@ -218,6 +250,8 @@ class WMReranker:
         )
         if cfg.score_mode == "verifier":
             self._assert_head_present(state, missing)
+        elif cfg.score_mode == "exec":
+            self._assert_exec_head_present(state, missing)
 
     def _assert_head_present(self, state: dict, missing) -> None:
         """F8: refuse to silently degrade verifier → goal_dist."""
@@ -239,6 +273,29 @@ class WMReranker:
                 "weights; refusing to silently fall back to goal_dist. "
                 "Train with loss.outcome.enabled=true or pass "
                 "--wm-score goal_dist explicitly."
+            )
+
+    def _assert_exec_head_present(self, state: dict, missing) -> None:
+        """R8 (spec §2.5 C-1): refuse to silently drop exec_head weights.
+
+        Mirrors ``_assert_head_present`` — if the config has no exec_head or
+        the checkpoint lacks trained ``exec_head.*`` weights (e.g. the old
+        ``wm_humaneval`` config was passed by mistake), raise instead of
+        evaluating an untrained head.
+        """
+        head_in_ckpt = any(k.startswith("exec_head") for k in state.keys())
+        head_missing = any(str(k).startswith("exec_head") for k in missing)
+        if getattr(self.model, "exec_head", None) is None:
+            raise RuntimeError(
+                "exec mode but model has no exec_head submodule — use the "
+                "wm_exec_humaneval config (NOT wm_humaneval), which silently "
+                "drops exec_head weights under strict=False."
+            )
+        if not head_in_ckpt or head_missing:
+            raise RuntimeError(
+                "exec mode but checkpoint lacks trained exec_head.* weights; "
+                "refusing to evaluate an untrained head. Train Stage-0E with "
+                "loss.exec.enabled=true (config wm_exec_humaneval)."
             )
 
     # -- encoding / prediction -----------------------------------------
@@ -306,3 +363,73 @@ class WMReranker:
         tv = self.cfg.verifier_temp if temp is None else temp
         tv = max(float(tv), 1e-3)
         return torch.sigmoid(logits / tv).detach().cpu()
+
+    def _encode_obs(self, texts: list[str]) -> torch.Tensor:
+        """Encoder embedding of raw observation texts (NO predict). (N, D).
+
+        For output texts (``serialize_output``) we want the encoder's view of
+        the value, matching the training target ``tgt_emb`` (the encoded
+        ``obs_next``), not a predicted next-state latent (spec §2.2 ô↔ẑ₁).
+        """
+        cap = self.cfg.max_obs_chars
+        info = {
+            "obs_text": [[t[:cap]] for t in texts],
+            "op": [[_run_test_op()] for _ in texts],
+        }
+        with torch.no_grad(), _maybe_autocast(self.device):
+            info = self.model.encode(info)
+            emb = info["emb"][:, 0]
+        return emb.float()
+
+    def exec_embeddings(
+        self, prompt: str, programs: list[str], inputs: list[str],
+        expected: list[str] | None = None,
+    ):
+        """Predicted output embeddings for the exec PEC matrix; zero execution.
+
+        Returns ``(o_hat (K,T,P) cpu, z_exp (T,P) cpu | None)``. Split out so
+        calibration can cache the embeddings once and sweep τ / cluster_thr in
+        pure Python (spec §2.4.1). ``expected`` given → also encode the expected
+        outputs; else ``z_exp`` is ``None`` (consistency path).
+        """
+        k, t = len(programs), len(inputs)
+        head = getattr(self.model, "exec_head", None)
+        if head is None:
+            raise RuntimeError("exec_embeddings requires a trained exec_head")
+        texts = [
+            serialize_exec(prompt, prog, inp)
+            for prog in programs for inp in inputs
+        ]
+        with torch.no_grad():
+            o_hat = head.predict_output(self._encode(texts)).view(k, t, -1)
+            z_exp = None
+            if expected is not None:
+                emb = self._encode_obs(
+                    [serialize_output(e or "") for e in expected]
+                )
+                z_exp = head.embed_output(emb).detach().cpu()
+        return o_hat.detach().cpu(), z_exp
+
+    def score_matrix_exec(
+        self, prompt: str, programs: list[str], tests: list[str],
+        *, expected: list[str] | None = None, tau: float | None = None,
+    ) -> "torch.Tensor":
+        """(K, T) execution-derived pass/consistency matrix; **zero execution**.
+
+        Predicts each candidate's output embedding ô(c,t) via ``serialize_exec``
+        + ``exec_head.predict_output``; the matrix is derived by the single
+        ``consensus.exec_pass_from_outputs`` (spec §2.4.1 C-8): ``expected``
+        given (has_doctest) → compare predicted output to the expected output;
+        else → candidate-vs-candidate output consistency. Empty ``tests`` →
+        ``(K, 0)`` so the caller falls back to log-prob argmax.
+        """
+        from pca.inference.consensus import exec_pass_from_outputs
+
+        if len(programs) == 0 or len(tests) == 0:
+            return torch.zeros((len(programs), len(tests)))
+        o_hat, z_exp = self.exec_embeddings(prompt, programs, tests, expected)
+        tau_v = self.cfg.exec_tau if tau is None else tau
+        matrix = exec_pass_from_outputs(
+            o_hat, z_exp, tau=tau_v, cluster_thr=self.cfg.exec_cluster_thr,
+        )
+        return torch.tensor(matrix)
