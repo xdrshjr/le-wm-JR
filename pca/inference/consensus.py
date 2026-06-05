@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 import math
 from collections import Counter
+from dataclasses import dataclass
 
 
 def _to_rows(matrix) -> list[list[float]]:
@@ -235,6 +236,141 @@ def exec_pass_from_outputs(
     if expected_embeds is not None:
         return _expected_matrix(out3, _to_list2(expected_embeds), tau)
     return _consistency_matrix(out3, tau, cluster_thr)
+
+
+# ----- round-9 discrete neural-interpreter derivation (spec §2.4 C-1) --
+# Invariant 1 (zero execution): everything below is pure string / float
+# arithmetic over ALREADY-DECODED interpreter outputs. ``ast.literal_eval``
+# only parses literals — it never evaluates code.
+
+_NORM_MAX_CHARS = 4096  # C-8: skip literal_eval on huge inputs
+_FLOAT_DECIMALS = 6     # 1e-6 float tolerance (spec §2.4 C-1)
+_ERR_MARK = "<<ERR>>"
+
+
+def _canon_value(v) -> str:
+    """Canonical repr of a parsed literal: numerics folded to Python
+    ``==`` semantics (``True``≡``1``, ``3.0``≡``3`` — what real execution
+    would equate; review fix R9), floats rounded (1e-6 tol, −0.0
+    collapsed), dict/set sorted, container shapes kept, recursive."""
+    if isinstance(v, bool):
+        return repr(int(v))
+    if isinstance(v, float):
+        r = round(v, _FLOAT_DECIMALS)
+        if r == 0:
+            return "0"
+        if math.isfinite(r) and r == int(r):
+            return repr(int(r))
+        return repr(r)
+    if isinstance(v, tuple):
+        inner = ", ".join(_canon_value(x) for x in v)
+        return f"({inner},)" if len(v) == 1 else f"({inner})"
+    if isinstance(v, list):
+        return "[" + ", ".join(_canon_value(x) for x in v) + "]"
+    if isinstance(v, (set, frozenset)):
+        return "{" + ", ".join(sorted(_canon_value(x) for x in v)) + "}"
+    if isinstance(v, dict):
+        items = sorted(
+            (_canon_value(k), _canon_value(val)) for k, val in v.items()
+        )
+        return "{" + ", ".join(f"{k}: {val}" for k, val in items) + "}"
+    return repr(v)
+
+
+def norm_repr(s: str) -> str:
+    """Canonical comparison form of one output ``repr`` string (spec §2.4).
+
+    Single source of truth for BOTH training label derivation
+    (``gen_exec_traj``) and inference EM / clustering (invariant 2):
+    literal round-trip when parseable (float 1e-6 tolerance, container
+    shape kept, dict/set sorted), whitespace-folded text otherwise;
+    ``<<ERR>> Cls`` keeps its class. Inputs over ``_NORM_MAX_CHARS`` skip
+    ``literal_eval`` and every parse fault is swallowed (C-8).
+    """
+    s = (s or "").strip()
+    if s.startswith(_ERR_MARK):
+        tail = s[len(_ERR_MARK):].strip()
+        cls = tail.split(":", 1)[0].split()
+        return f"{_ERR_MARK} {cls[0] if cls else 'ERR'}"
+    if len(s) > _NORM_MAX_CHARS:
+        return " ".join(s.split())
+    try:
+        return _canon_value(ast.literal_eval(s))
+    except Exception:  # noqa: BLE001 — any unparseable text → literal path
+        return " ".join(s.split())
+
+
+@dataclass(frozen=True)
+class InterpCalib:
+    """Dev-tuned interp knobs, one frozen dataclass so the deriver stays
+    within the CLAUDE.md 5-parameter cap (review C-3)."""
+
+    em_weight: float = 0.5
+    temp: float = 1.0
+    bias: float = 0.0
+
+
+def _interp_expected_cell(dec: str, lp: float, exp: str,
+                          calib: InterpCalib) -> float:
+    """has_doctest cell: w_em·EM + (1−w_em)·σ((lp̄−b)/T) (spec §2.4 C-1).
+
+    A predicted-``<<ERR>>`` decode scores 0 regardless of ``em_weight``
+    (R2 invariant — same rule as ``_interp_cluster_column``; without it
+    ``em_weight<0.5`` lets a crash cell outscore a correct EM match).
+    """
+    nd = norm_repr(dec)
+    if nd.startswith(_ERR_MARK):
+        return 0.0
+    em = 1.0 if nd == norm_repr(exp) else 0.0
+    like = _sigmoid((lp - calib.bias) / max(calib.temp, 1e-3))
+    return calib.em_weight * em + (1.0 - calib.em_weight) * like
+
+
+def _interp_cluster_column(col: list[str]) -> list[float]:
+    """no_doctest column: P[c] = |cluster(c)| / K by normalised equality.
+
+    Predicted-``<<ERR>>`` cells score 0 (R2 invariant: a majority crash
+    cluster must never outrank a correct minority candidate).
+    """
+    k = max(len(col), 1)
+    norms = [norm_repr(d) for d in col]
+    counts = Counter(norms)
+    return [
+        0.0 if n.startswith(_ERR_MARK) else counts[n] / k
+        for n in norms
+    ]
+
+
+def interp_pass_from_strings(decoded, lp_scores, expecteds=None, *,
+                             calib: InterpCalib = InterpCalib(),
+                             ) -> list[list[float]]:
+    """(K,T) decoded strings (+ expected-text lp̄) → (K,T) pass matrix.
+
+    The round-9 *discrete* sibling of ``exec_pass_from_outputs``: per
+    column, an expected value present → EM + calibrated likelihood
+    (``_interp_expected_cell``); absent → normalised-equality clustering
+    (``_interp_cluster_column``, MBR-EXEC style). The result feeds the
+    *unchanged* ``consensus_rank``; nothing is executed.
+    """
+    rows = [list(r) for r in decoded]
+    if not rows or not rows[0]:
+        return [[] for _ in rows]
+    k, t = len(rows), min(len(r) for r in rows)  # ragged-safe
+    lp = ([list(r) for r in lp_scores] if lp_scores is not None
+          else [[0.0] * t for _ in range(k)])
+    matrix = [[0.0] * t for _ in range(k)]
+    for j in range(t):
+        exp = expecteds[j] if expecteds is not None else None
+        if exp is not None:
+            for c in range(k):
+                matrix[c][j] = _interp_expected_cell(
+                    rows[c][j], lp[c][j], exp, calib
+                )
+        else:
+            col = _interp_cluster_column([rows[c][j] for c in range(k)])
+            for c in range(k):
+                matrix[c][j] = col[c]
+    return matrix
 
 
 def _extract_doctests(prompt: str, entry_point: str) -> list[str]:

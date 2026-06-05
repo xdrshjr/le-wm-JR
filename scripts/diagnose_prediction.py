@@ -240,7 +240,103 @@ def _run_exec(args) -> int:
     return 0
 
 
+# ----- round-9 interp attribution (spec §3 P1; zero HumanEval) ----------
+
+
+def _read_sft_labeled(path: Path, cap: int = 4000) -> list[dict]:
+    rows = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("label") is not None and r.get("expected") is not None:
+                rows.append(r)
+            if len(rows) >= cap:
+                break
+    return rows
+
+
+def _group_err(rows: list[dict], ems: list[float], key_fn) -> "float | None":
+    """Fraction of groups whose EVERY cell is mispredicted (EM≠label)."""
+    groups: dict = {}
+    for r, em in zip(rows, ems):
+        wrong = int(em) != int(r["label"])
+        key = key_fn(r["meta"]["instance_id"])
+        groups.setdefault(key, []).append(wrong)
+    if not groups:
+        return None
+    return round(
+        sum(1 for v in groups.values() if all(v)) / len(groups), 4
+    )
+
+
+def _interp_split(interp, rows: list[dict]) -> dict:
+    """Per split: EM-vs-likelihood error decomposition (spec §3 P1)."""
+    pairs = interp.score_expected(
+        [r["prompt"] for r in rows], [r["expected"] for r in rows]
+    )
+    lps = [lp for lp, _ in pairs]
+    ems = [1.0 if em else 0.0 for _, em in pairs]
+    labels = [int(r["label"]) for r in rows]
+    return {
+        "auroc_lp": _auroc(lps, labels),
+        "auroc_em": _auroc(ems, labels),
+        "em_rate": round(sum(ems) / max(len(ems), 1), 4),
+        "pred_acc": round(sum(int(e == y) for e, y in zip(ems, labels))
+                          / max(len(ems), 1), 4),
+        # candidate side: every input of one (problem, cand) wrong;
+        # input side: every candidate on one (problem, input) wrong.
+        "candidate_side_err": _group_err(
+            rows, ems, lambda iid: iid.rsplit("-i", 1)[0]),
+        "input_side_err": _group_err(
+            rows, ems,
+            lambda iid: (iid.rsplit("-cand", 1)[0]
+                         + "-i" + iid.rsplit("-i", 1)[-1])),
+        "n": len(rows),
+    }
+
+
+def _run_interp(args) -> int:
+    """R9 interp attribution: EM vs likelihood error, candidate vs input
+    side, src/transfer gap → attribution.json (guides, never blocks)."""
+    from calibrate_consensus import _build_interp
+
+    interp = _build_interp(args)
+    base = Path(args.traj)
+    res: dict = {"leak_check": "dev/multi-src only; HumanEval never read"}
+    for split, key in (("val", "src"), ("transfer", "transfer")):
+        rows = _read_sft_labeled(base / f"sft_{split}.jsonl")
+        if not rows:
+            res[f"{key}_n"] = 0
+            continue
+        res[key] = _interp_split(interp, rows)
+    src = (res.get("src") or {}).get("auroc_lp")
+    tr = (res.get("transfer") or {}).get("auroc_lp")
+    if src is not None and tr is not None:
+        res["transfer_gap"] = round(src - tr, 4)
+    tr_d = res.get("transfer") or {}
+    if tr_d.get("auroc_em") is not None and tr_d.get("auroc_lp") is not None:
+        res["verdict"] = (
+            "EM dominates → likelihood under-calibrated (raise em_weight)"
+            if tr_d["auroc_em"] >= tr_d["auroc_lp"]
+            else "likelihood dominates → keep mixed scoring"
+        )
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(res, indent=2), encoding="utf-8")
+    print(f"[diagnose] INTERP transfer={tr_d} "
+          f"gap={res.get('transfer_gap')} -> {out}")
+    return 0
+
+
 def run(args) -> int:
+    if getattr(args, "interp_mode", False):
+        if not args.executor_lora:
+            raise SystemExit("[diagnose] --interp needs --executor-lora")
+        return _run_interp(args)
+    if not args.wm_ckpt:
+        raise SystemExit("[diagnose] --wm-ckpt required outside --interp")
     if getattr(args, "exec_mode", False) or "exec" in args.wm_config:
         return _run_exec(args)
     from calibrate_consensus import (
@@ -271,15 +367,24 @@ def run(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wm-ckpt", required=True, help="Stage-0 ckpt to diagnose")
+    ap.add_argument("--wm-ckpt", default=None,
+                    help="Stage-0 ckpt to diagnose (required outside "
+                         "--interp)")
     ap.add_argument("--wm-config", default="wm_humaneval")
     ap.add_argument("--traj", required=True,
-                    help="per-test trajectory dir (reads its test.jsonl)")
+                    help="per-test trajectory dir (reads its test.jsonl; "
+                         "interp mode reads sft_{val,transfer}.jsonl)")
     ap.add_argument("--mbpp", default="data/benchmarks/mbpp/mbpp.jsonl")
     ap.add_argument("--out", default="runs/diag/r7_attribution.json")
     ap.add_argument("--exec", dest="exec_mode", action="store_true",
                     help="R8 exec attribution (auto-on if wm-config has "
                          "'exec'): output-pred vs pass error + transfer gap")
+    ap.add_argument("--interp", dest="interp_mode", action="store_true",
+                    help="R9 interp attribution: EM vs likelihood error, "
+                         "candidate vs input side, src/transfer gap")
+    ap.add_argument("--executor-lora", default=None,
+                    help="executor-LoRA adapter dir (interp mode)")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
     return run(ap.parse_args())
 
 

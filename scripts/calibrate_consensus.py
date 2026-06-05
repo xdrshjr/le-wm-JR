@@ -20,7 +20,7 @@ What it does (all on MBPP / held-out dev — **HumanEval is never read**):
 
 Spec deviation (recorded in spec.md §"实施过程发现的方案缺陷"): the v2 CLI
 named ``--dev dev_kcand``, but R6's "按 instance_id 的 candC 段聚合" requires
-the per-candidate grouping that ``dev_kcand`` (built by ``build_alignment_data``,
+the per-candidate grouping that ``dev_kcand`` (via ``build_alignment_data``,
 out of this node's change scope) does not preserve under per-test trajectories.
 We therefore read the per-test trajectory ``test`` split directly via
 ``--traj`` — equivalent, self-contained, and still MBPP-only.
@@ -53,6 +53,7 @@ from pca.inference.consensus import consensus_rank  # noqa: E402
 from pca.inference.wm_reranker import (  # noqa: E402
     WMReranker,
     WMRerankerConfig,
+    serialize_exec,
 )
 
 
@@ -462,7 +463,211 @@ def _run_exec(args) -> int:
     return 0
 
 
+# ----- round-9 interp calibration (spec §2.4 C-2 / §2.6 step 5) ---------
+
+
+def _is_interp(args) -> bool:
+    return bool(getattr(args, "interp_mode", False))
+
+
+def _build_interp(args):
+    """NeuralInterpreter on a bench-identical model load (weight sharing)."""
+    from bench_humaneval import _import_model
+    from pca.executor import NeuralInterpreter
+
+    _torch, tok, mdl = _import_model(args.model)
+    print(f"[calib_consensus] interp adapter={args.executor_lora}")
+    return NeuralInterpreter(tok, mdl, args.executor_lora)
+
+
+def _interp_cache(interp, tasks: list[dict]) -> list[dict]:
+    """Calib-INDEPENDENT per-task cache: EM bits, lp̄ grid and the
+    no_doctest cluster matrix (decode + one TF pass per task)."""
+    from pca.inference.consensus import (
+        interp_pass_from_strings,
+        norm_repr,
+    )
+
+    cache = []
+    for task in tasks:
+        progs, calls = task["programs"], task["inputs"]
+        k, t = len(progs), len(calls)
+        prompts = [serialize_exec(task["stub"], p, c)
+                   for p in progs for c in calls]
+        decoded = interp.decode_outputs(prompts)
+        dec2 = [decoded[i * t:(i + 1) * t] for i in range(k)]
+        has_exp = all(e is not None for e in task["expected"])
+        em2 = lp2 = err2 = None
+        if has_exp:
+            exp_norm = [norm_repr(e) for e in task["expected"]]
+            norms = [[norm_repr(dec2[c][j]) for j in range(t)]
+                     for c in range(k)]
+            em2 = [[1.0 if norms[c][j] == exp_norm[j] else 0.0
+                    for j in range(t)] for c in range(k)]
+            # mirrors consensus._interp_expected_cell's R2 ERR-zero rule —
+            # the grid MUST score the same cell formula as inference
+            err2 = [[norms[c][j].startswith("<<ERR>>") for j in range(t)]
+                    for c in range(k)]
+            lps = interp.expected_logprobs(
+                prompts, [e for _ in progs for e in task["expected"]]
+            )
+            lp2 = [lps[i * t:(i + 1) * t] for i in range(k)]
+        cluster = interp_pass_from_strings(dec2, None, None)
+        cache.append({"em": em2, "lp": lp2, "err": err2,
+                      "cluster": cluster})
+    return cache
+
+
+def _interp_acc(cache, tasks, calib, rank_kw: dict) -> float:
+    """Dev rerank acc for one grid point; ``calib=None`` = the no_doctest
+    clustering path (mirrors ``consensus._interp_expected_cell`` on the
+    precomputed EM bits — same w·EM + (1−w)·σ((lp̄−b)/T) formula)."""
+    w, temp, bias = calib if calib else (0.0, 1.0, 0.0)
+    correct, n = 0, 0
+    for entry, task in zip(cache, tasks):
+        if calib is not None and entry["em"] is None:
+            continue
+        if calib is None:
+            mat = entry["cluster"]
+        else:
+            mat = [
+                [0.0 if err else
+                 w * em + (1.0 - w) * _sigmoid(lp - bias, temp)
+                 for em, lp, err in zip(em_row, lp_row, err_row)]
+                for em_row, lp_row, err_row in
+                zip(entry["em"], entry["lp"], entry["err"])
+            ]
+        scores = consensus_rank(mat, [0.0] * len(mat), **rank_kw)
+        pred = max(range(len(scores)), key=lambda i: scores[i])
+        correct += task["per_cand"][pred]
+        n += 1
+    return correct / max(n, 1)
+
+
+def _sc_vote_acc(tasks: list[dict]) -> float:
+    """AST-canonical majority vote on dev (the SC-equivalent baseline the
+    stratified fallback gate compares against; spec §2.4 C-2)."""
+    from collections import Counter
+
+    from bench_humaneval import ast_canonical
+
+    correct = 0
+    for task in tasks:
+        canon = [ast_canonical(p) for p in task["programs"]]
+        counts = Counter(canon)
+        top = max(counts.values())
+        pred = next(i for i, c in enumerate(canon) if counts[c] == top)
+        correct += task["per_cand"][pred]
+    return correct / max(len(tasks), 1)
+
+
+def _rank_grid(args) -> list[tuple]:
+    """(mode, theta, gamma) points; gamma only swept for soft_conf."""
+    grid = []
+    for mode in _modes(args.search_mode):
+        gammas = _floats(args.search_gamma) if mode == "soft_conf" else [1.0]
+        for theta in _floats(args.search_theta):
+            for gamma in gammas:
+                grid.append((mode, theta, gamma))
+    return grid
+
+
+def _select_interp(cache, tasks, args) -> dict:
+    """Grid em_weight × T × b × theta × mode × gamma; per-stratum dev
+    accuracy vs the SC vote baseline → ``fallback.<stratum>`` (C-2): a
+    stratum keeps interp ONLY if it beats SC by >2pp, clamping the worst
+    case at ≈SC instead of R8's below-base collapse.
+
+    SAME-SUPPORT comparison (review fix R9): ``acc_has`` is computed over
+    the has-expected tasks only, so its SC baseline must be too — a
+    whole-set SC dragged down by tasks the has-stratum never sees would
+    spuriously clear the +2pp margin."""
+    from itertools import product
+
+    has_idx = [i for i, e in enumerate(cache) if e["em"] is not None]
+    sc_all = _sc_vote_acc(tasks)
+    sc_has = (_sc_vote_acc([tasks[i] for i in has_idx])
+              if has_idx else sc_all)
+    knob_grid = list(product(_floats(args.search_em_weight),
+                             _floats(args.search_temp),
+                             _floats(args.search_bias)))
+    best, best_score = None, -1.0
+    for mode, theta, gamma in _rank_grid(args):
+        rank_kw = {"theta": theta, "mode": mode, "gamma": gamma}
+        acc_no = _interp_acc(cache, tasks, None, rank_kw)
+        for calib in knob_grid:
+            acc_has = _interp_acc(cache, tasks, calib, rank_kw)
+            if acc_has + acc_no > best_score:
+                best_score = acc_has + acc_no
+                best = (mode, theta, gamma, calib, acc_has, acc_no)
+    mode, theta, gamma, (w, temp, bias), acc_has, acc_no = best
+    margin = 0.02
+    fallback = {
+        "has_doctest": "none" if acc_has > sc_has + margin else "sc_vote",
+        "no_doctest": "none" if acc_no > sc_all + margin else "sc_vote",
+    }
+    return {
+        "em_weight": w, "temp": temp, "bias": bias, "theta": theta,
+        "consensus_mode": mode, "gamma": gamma,
+        "n_proposed_inputs": args.n_proposed_inputs, "theta_fail": 0.5,
+        "fallback": fallback,
+        "dev": {"interp_acc": round(acc_has, 4),
+                "interp_acc_no_doctest": round(acc_no, 4),
+                "sc_acc": round(sc_all, 4), "margin": margin,
+                "n_dev": len(tasks), "n_dev_has": len(has_idx),
+                "per_stratum": {
+                    "has_doctest": {"interp": round(acc_has, 4),
+                                    "sc": round(sc_has, 4)},
+                    "no_doctest": {"interp": round(acc_no, 4),
+                                   "sc": round(sc_all, 4)}}},
+        "leak_check": "multi-source dev only; HumanEval never read",
+    }
+
+
+def _run_interp(args) -> int:
+    """R9: calibrate the interp block; non-destructive config merge."""
+    rows = _read_jsonl(Path(args.traj) / "test.jsonl")
+    tasks = _exec_dev_tasks(_group_exec(rows))
+    # Unwinnable tasks (no candidate correct — incl. all-None-label
+    # groups) carry zero ranking signal and only dilute every accuracy
+    # against the fixed +2pp margin; drop them from the interp gate
+    # (review fix R9; the R8 --exec path is untouched).
+    n_all = len(tasks)
+    tasks = [t for t in tasks if any(t["per_cand"])]
+    if n_all - len(tasks):
+        print(f"[calib_consensus] dropped {n_all - len(tasks)}/{n_all} "
+              "unwinnable dev tasks (no correct candidate)")
+    if not tasks:
+        raise SystemExit(
+            f"[calib_consensus] no interp dev tasks from {args.traj}"
+        )
+    interp = _build_interp(args)
+    chosen = _select_interp(_interp_cache(interp, tasks), tasks, args)
+    print(f"[calib_consensus] INTERP em_w={chosen['em_weight']} "
+          f"T={chosen['temp']} b={chosen['bias']} theta={chosen['theta']} "
+          f"mode={chosen['consensus_mode']} gamma={chosen['gamma']} "
+          f"dev={chosen['dev']} fallback={chosen['fallback']}")
+    out_dir = Path(args.out) if args.out else Path(args.executor_lora)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "consensus_config.json"
+    payload = {}
+    if out_path.exists():  # non-destructive: old exec/top-level keys stay
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+    payload["interp"] = chosen
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[calib_consensus] wrote {out_path}")
+    return 0
+
+
 def run(args) -> int:
+    if _is_interp(args):
+        if not args.executor_lora:
+            raise SystemExit("[calib_consensus] --interp needs "
+                             "--executor-lora")
+        return _run_interp(args)
+    if not args.wm_ckpt:
+        raise SystemExit("[calib_consensus] --wm-ckpt is required outside "
+                         "--interp mode")
     if _is_exec(args):
         return _run_exec(args)
     mbpp = _load_mbpp(args.mbpp)
@@ -483,7 +688,8 @@ def run(args) -> int:
           f"acc={chosen['dev']['acc']} base={chosen['dev']['baseline_argmax']} "
           f"guardrail={chosen['dev']['guardrail']} n_dev={len(tasks)}")
 
-    out_dir = Path(args.out) if args.out else Path(args.wm_ckpt).resolve().parent
+    out_dir = Path(args.out) if args.out \
+        else Path(args.wm_ckpt).resolve().parent
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "verifier_temp": temp,
@@ -503,7 +709,8 @@ def run(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wm-ckpt", required=True, help="Stage-0 best ckpt")
+    ap.add_argument("--wm-ckpt", default=None,
+                    help="Stage-0 best ckpt (required outside --interp)")
     ap.add_argument("--wm-config", default="wm_humaneval")
     ap.add_argument("--traj", required=True,
                     help="per-test trajectory dir (reads its test.jsonl)")
@@ -523,8 +730,24 @@ def main() -> int:
                     help="exec output-similarity temperature grid (§2.4.1)")
     ap.add_argument("--search-cluster-thr", default="0.6,0.75",
                     help="exec consistency cluster-threshold grid (§2.4.1)")
+    # R9 interp-mode grids (spec §2.4 C-1/C-2): discrete EM + likelihood.
+    ap.add_argument("--interp", dest="interp_mode", action="store_true",
+                    help="calibrate the R9 interp block (needs "
+                         "--executor-lora; writes interp into the config)")
+    ap.add_argument("--executor-lora", default=None,
+                    help="executor-LoRA adapter dir (interp mode)")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--search-em-weight", default="0,0.3,0.5,0.7,1.0",
+                    help="EM vs likelihood mix grid (spec §2.4 C-1)")
+    ap.add_argument("--search-temp", default="0.5,1,2",
+                    help="likelihood sigmoid temperature grid (interp)")
+    ap.add_argument("--search-bias", default="0.0,-0.5,-1.0,-2.0",
+                    help="likelihood sigmoid bias grid (interp)")
+    ap.add_argument("--n-proposed-inputs", type=int, default=8,
+                    help="no_doctest self-proposed input cap (spec §2.4)")
     ap.add_argument("--out", default=None,
-                    help="output dir (default: alongside --wm-ckpt)")
+                    help="output dir (default: alongside --wm-ckpt / "
+                         "the adapter dir in interp mode)")
     return run(ap.parse_args())
 
 

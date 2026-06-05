@@ -40,6 +40,70 @@ def _repair_user(problem: str, body: str, failing: list | None = None) -> str:
     )
 
 
+def _parse_io(tests: list) -> tuple[list, list]:
+    """Asserts → ``(call_forms, expecteds)``, dropping unparseable ones."""
+    from pca.inference.consensus import parse_assert_io
+
+    calls, expecteds = [], []
+    for t in tests:
+        call, expected = parse_assert_io(t)
+        if call is None:
+            continue
+        calls.append(call)
+        expecteds.append(expected)
+    return calls, expecteds
+
+
+def _majority_rep(col: list[str]) -> "str | None":
+    """Raw decoded string of the column's largest NON-ERROR normalised
+    cluster; ``None`` when only crash clusters exist — a ``<<ERR>>``
+    representative would steer repair toward the very cluster the R2
+    invariant zero-scores (review fix R9)."""
+    from collections import Counter
+
+    from pca.inference.consensus import norm_repr
+
+    norms = [norm_repr(d) for d in col]
+    counts = Counter(n for n in norms if not n.startswith("<<ERR>>"))
+    if not counts:
+        return None
+    top = counts.most_common(1)[0][0]
+    return col[norms.index(top)]
+
+
+def _interp_hints(matrix: list, decoded: list, io: tuple, best: int,
+                  thr: float) -> list[str]:
+    """Top-1's predicted-failing cells → human-readable repair triples
+    (spec §2.5 D-1 step 2: "on input x your code returns ŷ; expected e").
+
+    ``io = (calls, expecteds)``; ``expecteds is None`` = no_doctest — the
+    hint compares against the majority cluster's representative instead.
+    """
+    from pca.inference.consensus import norm_repr
+
+    calls, exps = io
+    hints: list[str] = []
+    for t, call in enumerate(calls):
+        y_hat = decoded[best][t]
+        if exps is not None and exps[t] is not None:
+            if (matrix[best][t] < thr
+                    and norm_repr(y_hat) != norm_repr(exps[t])):
+                # the EM guard kills the degenerate "returns X; expected X"
+                # hint a low em_weight can produce (review fix R9)
+                hints.append(f"On input {call} your code returns {y_hat}; "
+                             f"expected {exps[t]}")
+        else:
+            col_best = max(matrix[c][t] for c in range(len(matrix)))
+            if matrix[best][t] < col_best:
+                rep = _majority_rep([decoded[c][t]
+                                     for c in range(len(decoded))])
+                if rep is None or norm_repr(rep) == norm_repr(y_hat):
+                    continue  # only-ERR / tied clusters — no useful hint
+                hints.append(f"On input {call} your code returns {y_hat}; "
+                             f"most candidates return {rep}")
+    return hints[:5]
+
+
 class RepairLoop:
     """Predict→repair→re-rank with the aligned WM (executes nothing)."""
 
@@ -159,6 +223,88 @@ class RepairLoop:
             [c.text for c in merged],
         )
         return merged[self._argmax(new_scores)], new_scores
+
+    # ----- round-9 interp closed loop (spec §2.5 D-1; zero execution) ---
+
+    def _gen_repairs_via(self, interp, problem: str, body: str,
+                         hints: list[str]) -> list[str]:
+        """Repair generation through the interpreter's shared LLM — inside
+        ``generation_ctx()`` so the executor-LoRA is DISABLED (inv. 6)."""
+        tok = interp.tok
+        chat = tok.apply_chat_template(
+            [{"role": "system", "content": _REPAIR_SYS},
+             {"role": "user", "content": _repair_user(problem, body, hints)}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        inputs = tok(chat, return_tensors="pt").to(interp.device)
+        do_sample = self.temperature > 0
+        with torch.no_grad(), interp.generation_ctx():
+            out = interp.model.generate(
+                **inputs, do_sample=do_sample,
+                temperature=self.temperature if do_sample else 1.0,
+                top_p=0.95 if do_sample else 1.0,
+                num_return_sequences=self.n_repair,
+                max_new_tokens=self.max_new_tokens,
+                pad_token_id=tok.pad_token_id, eos_token_id=tok.eos_token_id,
+            )
+        in_len = inputs["input_ids"].shape[1]
+        return [
+            tok.decode(o[in_len:], skip_special_tokens=True) for o in out
+        ]
+
+    def repair_and_rerank_interp(self, prompt: str, cands: list, interp,
+                                 tests: list, cfg: dict) -> dict:
+        """Interp closed loop (spec §2.5 D-1): rank by the DISCRETE interp
+        consensus; take the top-1's predicted-failing cells; repair with
+        the first HUMAN-READABLE imagined execution ("on input x your code
+        returns ŷ; expected e"); re-rank the merged pool. Zero execution.
+
+        ``cfg`` keys: ``calib`` (InterpCalib), ``theta``/``mode``/``gamma``
+        (consensus), ``theta_fail`` (cell threshold), ``has_doctest``
+        (TRUE stratum from the bench — proposer-guessed expecteds are
+        never trusted; review fix R9), ``pick`` (optional tie-break-chain
+        picker), ``assemble`` (prompt, text) → Candidate. Returns a dict
+        whose ``total_budget`` (= K + R) feeds the mandatory equal-budget
+        SC@(K+R) comparison (spec §2.5 D-1 step 4 — without it the gain
+        may NOT be reported).
+        """
+        from pca.inference.consensus import InterpCalib, consensus_rank
+
+        calls, expecteds = _parse_io(tests or [])
+        logprobs = [c.logprob for c in cands]
+        base = {"repaired": False, "total_budget": len(cands)}
+        if not calls:
+            return {**base, "pick": cands[self._argmax(logprobs)],
+                    "scores": []}
+        exps = expecteds if cfg.get("has_doctest") else None
+        calib = cfg.get("calib") or InterpCalib()
+        kw = {"theta": cfg.get("theta", 0.5),
+              "mode": cfg.get("mode", "soft_conf"),
+              "gamma": cfg.get("gamma", 1.0)}
+
+        def _pick(pool, scores):
+            picker = cfg.get("pick")
+            if picker is not None:
+                return picker(pool, scores)[0]
+            return pool[self._argmax(scores)]
+
+        mat, dec = interp.matrix(prompt, [c.program for c in cands], calls,
+                                 exps, calib=calib)
+        scores = consensus_rank(mat, logprobs, **kw)
+        best = self._argmax(scores)
+        thr = cfg.get("theta_fail", self.repair_threshold)
+        hints = _interp_hints(mat, dec, (calls, exps), best, thr)
+        if not hints:
+            return {**base, "pick": _pick(cands, scores), "scores": scores}
+        texts = self._gen_repairs_via(interp, prompt, cands[best].text,
+                                      hints)
+        merged = list(cands) + [cfg["assemble"](prompt, t) for t in texts]
+        mat2, _ = interp.matrix(prompt, [c.program for c in merged], calls,
+                                exps, calib=calib)
+        scores2 = consensus_rank(mat2, [c.logprob for c in merged], **kw)
+        return {"pick": _pick(merged, scores2), "scores": scores2,
+                "repaired": True, "n_hints": len(hints),
+                "total_budget": len(cands) + len(texts)}
 
     def _pec_scores(
         self, prompt: str, programs: list[str], tests: list[str],
